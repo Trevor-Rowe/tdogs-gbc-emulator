@@ -39,5 +39,5 @@ almost never be the sole source of truth. As such, I prefer to use ChatGPT for t
   
 I am not against generated code but a developer should be responsible for verfication and testing.
 
-I'll be posting progress on LinkedIn and maybe YouTube depending on time.
+I'll be posting progress on LinkedIn and maybe YouTube depending on time! :)
   
