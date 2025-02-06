@@ -24,11 +24,11 @@ the GBC's architeture. Here are some of the critical resources:
   6. I/0 and interrupts.                                      | *incomplete*
 
 **Project Structure**
-  roms    -> contains ROM files to be read in and executed by the system.
-  lib     -> external resources.
-  src     -> .c files.
-  include -> .h files.
-  test    -> CUnit testing. 
+  * roms    -> contains ROM files to be read in and executed by the system.
+  * lib     -> external resources.
+  * src     -> .c files.
+  * include -> .h files.
+  * test    -> CUnit testing. 
 
 **A Word About LLM Usage**
 Generative LLM models like ChatGPT are great for expediting research and development when used cautiously. It should
