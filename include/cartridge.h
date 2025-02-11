@@ -1,57 +1,52 @@
 #ifndef CARTRIDGE_H
 #define CARTRIDGE_H
 #include<stdint.h>
+#include<stdbool.h>
 
-typedef struct
-{
-    // ROM Memory info for banking purposes.
-    unsigned long rom_size;
-    uint16_t  total_rom_banks;
-    uint16_t  current_rom_bank;
+/*
+    Reads in ROM and initializes cartridge context. 
+    @param file_path   -> location of ROM file being opened
+    @param testing     -> Indicates testing ROM. Skips header info and starts at 0x00.
+    @return int (bool) -> Was initialization successful?
+    @note              -> Call this function first. :)  
+*/
+int init_cartridge(char *file_path, bool testing);
 
-} rom_memory;
-
-typedef struct
-{
-    // RAM Memory info for banking purposes.
-    unsigned long ram_size;
-    uint16_t total_ram_banks;
-    uint16_t current_ram_bank;
-
-} ram_memory;
-
-// Inline with Pandocs specifications. 
-typedef struct
-{                       // Description             | [start - end)
-    char title[15];     // Game Title              | 0x0134 - 0x0143
-    /* 
-    char m_code[4];     // Manufacturer Code       | 0x013F - 0x0143
-    */
-    uint8_t  cgb_flag;  // Enable Color Mode       | 0x0143 - 0x0144
-    uint16_t nl_code;   // Game's publisher        | 0x0144 - 0x0146
-    /*
-    uint8_t sgb_flag;   // SGB function support?   | 0x0146 - 0x0147
-    */
-    uint8_t cart_type;  // Mapping schema          | 0x0147 - 0x0148
-    /*
-    uint8_t rom_size;   // Rom Size/# of Banks     | 0x0148 - 0x0149
-    uint8_t ram_size;   // Ram Size (If applicable)| 0x0149 - 0x014A
-    */
-    uint8_t dest_code;  // Destination code        | 0x014A - 0x014B
-    uint8_t ol_code;    // Old license code        | 0x014B - 0x014C
-    uint8_t version;    // Version number          | 0x014C - 0x014D
-    uint8_t checksum;   // Header checksum         | 0x014D - 0x014E
-
-} rom_header;
-
-int init_cartridge();
-
+/*
+    Prints header, rom, and ram information derived from the ROM file.
+    @todo            -> Possible code refactor into samller print functions.
+*/
 void print_cartridge_info();
 
+/*
+    Cleans up memory and pointers that were used in a global context.
+    @note           -> Call this only during program exit.
+*/
 void tidy_cartridge();
 
-uint8_t read_rom_memory();
+/*
+    Reads byte from ROM content.
+    @param address -> 16-Bit memory address
+    @return uint8_t-> 8-Bit value from ROM memory
+    @note 1        -> Takes into account current ROM/RAM bank.
+    @note 2        -> Test with MBC and MBC1 first.
+    @todo          -> Add support for larger ROM types. 
+*/
+uint8_t read_rom_memory(uint16_t address);
 
-uint8_t write_rom_memory();
+/*
+    Handles ROM and RAM Memory Banking.
+    @param address -> 16-Bit memory address
+    @param value   -> 8-Bit value to 'write'
+    @note          -> Emulates the effect of writing to the ROM without altering it.
+                   -> Test with MBC and MBC1 first.
+    @todo          -> Add support for larger ROM types. 
+*/
+void write_rom_memory(uint16_t address, uint8_t value);
+
+/*
+    @return        -> Address to begin ROM execution.
+*/
+uint16_t get_rom_start(); 
 
 #endif

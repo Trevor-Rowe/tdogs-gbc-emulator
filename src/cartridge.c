@@ -1,24 +1,156 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <cartridge.h>
+#include <stdbool.h>
+#include "cartridge.h"
+#include "common.h"
+
+/* CONSTANTS FOR READABILITY */
+
+typedef enum
+{
+    TITLE_ADDRESS             = 0x0134,
+    COLOR_MODE_ENABLE_ADDRESS = 0x0143,
+    NEW_PUBLISHER_ADDRESS     = 0x0144,
+    MBC_SCHEMA_ADDRESS        = 0x0147,
+    DESTINATION_ADDRESS       = 0x014A,
+    OLD_PUBLISHER_ADDRESS     = 0x014B,
+    VERSION_ADDRESS           = 0x014C,
+    CHECKSUM_ADDRESS          = 0x014D,
+    ROM_SETTINGS_ADDRESS      = 0x0148,
+    RAM_SETTINGS_ADDRESS      = 0x0149
+
+} HeaderAddresses;
+
+typedef enum
+{
+    RAM_ENABLE_ADDRESS      = 0x1FFF,
+    ROM_BANK_SEL_L5_ADDRESS = 0x3FFF,
+    RAM_BANK_SEL_ADDRESS    = 0x5FFF,
+    SET_BANK_MODE_ADDRESS   = 0x7FFF, 
+    ROM_EXECUTION_ADDRESS   = 0x0100
+
+} RomAddresses;
+
+typedef enum
+{
+    ROM_ONLY                       = 0x00,
+    MBC1                           = 0x01,
+    MBC1_RAM                       = 0x02,
+    MBC1_RAM_BATTERY               = 0x03,
+    MBC2                           = 0x05,
+    MBC2_BATTERY                   = 0x06,
+    MMM01                          = 0x0B,
+    MMM01_RAM                      = 0x0C,
+    MMM01_RAM_BATTERY              = 0x0D, 
+    MBC3_TIMER_BATTERY             = 0x0F,
+    MBC3                           = 0x11,
+    MBC3_RAM                       = 0x12,
+    MBC3_RAM_BATTERY               = 0x13,
+    MBC5                           = 0x19,
+    MBC5_RAM                       = 0x1A,
+    MBC5_RAM_BATTERY               = 0x1B,
+    MBC5_RUMBLE                    = 0x1C,
+    MBC5_RUMBLE_RAM                = 0x1D,
+    MBC5_RUMBLE_RAM_BATTERY        = 0x1E,
+    MBC6                           = 0x20,
+    MBC7_SENSOR_RUMBLE_RAM_BATTERY = 0x22
+
+} CartridgeTypes;
+
+typedef enum
+{
+    ROM_BANK_MODE    = 0,
+    RAM_BANK_MODE    = 1,
+    DEFAULT_ROM_BANK = 1,
+    DEFUALT_RAM_BANK = 1,
+    RAM_ENABLED      = 0x0A,
+    RAM_DISABLED     = 0x00,
+    ROM_BANK_SIZE    = 0x4000,
+    RAM_BANK_SIZE    = 8000,
+
+} CartridgeSettings; 
+
+typedef enum
+{
+    ROM_BANK_CODE_NONE = 0x00,
+    ROM_BANK_CODE_4    = 0x01,
+    ROM_BANK_CODE_8    = 0x02,
+    ROM_BANK_CODE_16   = 0x03,
+    ROM_BANK_CODE_32   = 0x04,
+    ROM_BANK_CODE_64   = 0x05,
+    ROM_BANK_CODE_128  = 0x06,
+    ROM_BANK_CODE_256  = 0x07,
+    ROM_BANK_CODE_512  = 0x08
+
+} RomSettings;
+
+typedef enum
+{
+    RAM_BANK_CODE_NONE   = 0x00,
+    RAM_BANK_CODE_UNUSED = 0x01,
+    RAM_BANK_CODE_1      = 0x02,
+    RAM_BANK_CODE_4      = 0x03,
+    RAM_BANK_CODE_16     = 0x04,
+    RAM_BANK_CODE_8      = 0x05
+
+} RamSettings;
+
+/* STATE MANGEMENT */
+
+typedef struct
+{
+    // ROM Memory info for banking purposes.
+    unsigned long rom_size;
+    uint16_t total_rom_banks;
+    uint8_t  upper_bank;
+    uint8_t  lower_bank;
+
+} RomMemory; // (12 Bytes)
+
+typedef struct
+{
+    // RAM Memory info for banking purposes.
+    unsigned long ram_size;
+    uint16_t total_ram_banks;
+    uint16_t current_ram_bank;
+
+} RamMemory; // (12 Bytes) 
+
+typedef struct
+{                       // Description             | [start - end)
+    char title[15];     // Game Title              | 0x0134 - 0x0143
+    uint8_t  cgb_flag;  // Enable Color Mode       | 0x0143 - 0x0144
+    uint16_t nl_code;   // Game's publisher        | 0x0144 - 0x0146
+    uint8_t cart_type;  // Mapping schema          | 0x0147 - 0x0148
+    uint8_t dest_code;  // Destination code        | 0x014A - 0x014B
+    uint8_t ol_code;    // Old license code        | 0x014B - 0x014C
+    uint8_t version;    // Version number          | 0x014C - 0x014D
+    uint8_t checksum;   // Header checksum         | 0x014D - 0x014E
+
+} RomHeader; // (23 Bytes)
 
 typedef struct
 {
     long file_size;
-    rom_header header;
-    rom_memory rom_memory;
-    ram_memory ram_memory;
+    RomHeader header;
+    RomMemory rom_memory;
+    RamMemory ram_memory;
+    int banking_mode; // 0-> ROM | 1-> RAM
+    bool ram_enable;
+    bool testing;
     uint8_t *content;
 
-} cartridge_context;
+} Cartridge;  // (61 Bytes)
 
-static cartridge_context *cart_context;
+/* GLOBAL STATE POINTERS */
 
-/* Local Helper Functions */
+static Cartridge *cart;
+
+/* STATIC (PRIVATE) HELPERS FUNCTIONS */
 
 // Reads file and returns pointer to loaded content.
-static uint8_t *get_rom_content(char *file_path, cartridge_context *context) 
+static uint8_t *get_rom_content(char *file_path, Cartridge *context) 
 {
     // Open file with fopen() in "r"ead "b"inary mode.
     printf("Reading file at %s\n", file_path);
@@ -49,7 +181,7 @@ static uint8_t *get_rom_content(char *file_path, cartridge_context *context)
         return NULL;
     }
 
-    printf("Successfully loaded %ld from %s\n", file_size, file_path);
+    printf("Successfully loaded %ld bytes from %s\n", file_size, file_path);
     context->file_size = file_size;
     // Tidy up.
     fclose(file);
@@ -57,18 +189,19 @@ static uint8_t *get_rom_content(char *file_path, cartridge_context *context)
     return buffer;
 }
 
-// Loads context->header.title char array.
-static void load_rom_title(cartridge_context *context, uint8_t *contents)
+// Loads cartridge title from ROM.
+static void load_rom_title(Cartridge *context, uint8_t *contents)
 {
-    int size = 15; // 0x0134 - 0x0143
+    int size = 15; 
     for (int i = 0; i < size - 1; i++) 
     {
-        context->header.title[i] =  contents[0x0134 + i];
+        context->header.title[i] =  contents[TITLE_ADDRESS + i];
     }
     context->header.title[size - 1] = '\0';
 }
 
-static const char* get_publisher_name(uint16_t hex_code) 
+// Returns publisher name given 2 Byte code.
+static const char *get_publisher_name(uint16_t hex_code) 
 {
     switch (hex_code) 
     {
@@ -137,121 +270,124 @@ static const char* get_publisher_name(uint16_t hex_code)
     }
 }
 
-const char* get_cartridge_type(uint8_t hex_code) 
+// Returns cartridge type (MBC, MBC1, ETC) given single byte code.
+static const char *get_cartridge_type(uint8_t hex_code) 
 {
     switch (hex_code) 
     {
-        case 0x00: return "ROM ONLY";
-        case 0x01: return "MBC1";
-        case 0x02: return "MBC1+RAM";
-        case 0x03: return "MBC1+RAM+BATTERY";
-        case 0x05: return "MBC2";
-        case 0x06: return "MBC2+BATTERY";
-        case 0x08: return "ROM+RAM";
-        case 0x09: return "ROM+RAM+BATTERY";
-        case 0x0B: return "MMM01";
-        case 0x0C: return "MMM01+RAM";
-        case 0x0D: return "MMM01+RAM+BATTERY";
-        case 0x0F: return "MBC3+TIMER+BATTERY";
-        case 0x10: return "MBC3+TIMER+RAM+BATTERY";
-        case 0x11: return "MBC3";
-        case 0x12: return "MBC3+RAM";
-        case 0x13: return "MBC3+RAM+BATTERY";
-        case 0x19: return "MBC5";
-        case 0x1A: return "MBC5+RAM";
-        case 0x1B: return "MBC5+RAM+BATTERY";
-        case 0x1C: return "MBC5+RUMBLE";
-        case 0x1D: return "MBC5+RUMBLE+RAM";
-        case 0x1E: return "MBC5+RUMBLE+RAM+BATTERY";
-        case 0x20: return "MBC6";
-        case 0x22: return "MBC7+SENSOR+RUMBLE+RAM+BATTERY";
-        case 0xFC: return "POCKET CAMERA";
-        case 0xFD: return "BANDAI TAMA5";
-        case 0xFE: return "HuC3";
-        case 0xFF: return "HuC1+RAM+BATTERY";
-        default: return "Unknown Cartridge Type";
+        case ROM_ONLY:                       return "ROM ONLY";
+        case MBC1:                           return "MBC1";
+        case MBC1_RAM:                       return "MBC1+RAM";
+        case MBC1_RAM_BATTERY:               return "MBC1+RAM+BATTERY";
+        case MBC2:                           return "MBC2";
+        case MBC2_BATTERY:                   return "MBC2+BATTERY";
+        case MMM01:                          return "MMM01";
+        case MMM01_RAM:                      return "MMM01+RAM";
+        case MMM01_RAM_BATTERY:              return "MMM01+RAM+BATTERY";
+        case MBC3_TIMER_BATTERY:             return "MBC3+TIMER+BATTERY";
+        case MBC3:                           return "MBC3";
+        case MBC5:                           return "MBC5";
+        case MBC5_RAM:                       return "MBC5+RAM";
+        case MBC5_RAM_BATTERY:               return "MBC5+RAM+BATTERY";
+        case MBC5_RUMBLE:                    return "MBC5+RUMBLE";
+        case MBC5_RUMBLE_RAM:                return "MBC5+RUMBLE+RAM";
+        case MBC5_RUMBLE_RAM_BATTERY:        return "MBC5+RUMBLE+RAM+BATTERY";
+        case MBC6:                           return "MBC6";
+        case MBC7_SENSOR_RUMBLE_RAM_BATTERY: return "MBC7+SENSOR+RUMBLE+RAM+BATTERY";
+        default:                             return "Unknown Cartridge Type";
     }
 }
 
-// Loads ROM settings into context.
-static void load_rom_settings(uint8_t hex_code, cartridge_context *context) 
+// Loads ROM settings into cart based on provided single byte code.
+static void load_rom_settings(uint8_t hex_code, Cartridge *context) 
 {
    context->rom_memory.rom_size = 32000 * (1 << hex_code);
    switch (hex_code) 
    {
-        case 0x00:
-            context->rom_memory.current_rom_bank = 1;
+        case ROM_BANK_CODE_NONE:
+            context->rom_memory.lower_bank = 1;
+            context->rom_memory.upper_bank = 0;
             context->rom_memory.total_rom_banks = 2; 
             break;
-        case 0x01:
-            context->rom_memory.current_rom_bank = 1;
+        case ROM_BANK_CODE_4:
+            context->rom_memory.lower_bank = 1;
+            context->rom_memory.upper_bank = 0;
             context->rom_memory.total_rom_banks = 4; 
             break;
-        case 0x02:
-            context->rom_memory.current_rom_bank = 1;
+        case ROM_BANK_CODE_8:
+            context->rom_memory.lower_bank = 1;
+            context->rom_memory.upper_bank = 0;
             context->rom_memory.total_rom_banks = 8; 
             break;
-        case 0x03:
-            context->rom_memory.current_rom_bank = 1;
+        case ROM_BANK_CODE_16:
+            context->rom_memory.lower_bank = 1;
+            context->rom_memory.upper_bank = 0;
             context->rom_memory.total_rom_banks = 16;
             break;
-        case 0x04:
-            context->rom_memory.current_rom_bank = 1;
+        case ROM_BANK_CODE_32:
+            context->rom_memory.lower_bank = 1;
+            context->rom_memory.upper_bank = 0;
             context->rom_memory.total_rom_banks = 32;
             break;
-        case 0x05:
-            context->rom_memory.current_rom_bank = 1;
+        case ROM_BANK_CODE_64:
+            context->rom_memory.lower_bank = 1;
+            context->rom_memory.upper_bank = 0;
             context->rom_memory.total_rom_banks = 64;
             break;
-        case 0x06:
-            context->rom_memory.current_rom_bank = 1;
+        case ROM_BANK_CODE_128:
+            context->rom_memory.lower_bank = 1;
+            context->rom_memory.upper_bank = 0;
             context->rom_memory.total_rom_banks = 128;
             break;
-        case 0x07:
-            context->rom_memory.current_rom_bank = 1;
+        case ROM_BANK_CODE_256:
+            context->rom_memory.lower_bank = 1;
+            context->rom_memory.upper_bank = 0;
             context->rom_memory.total_rom_banks = 256;
             break;
-        case 0x08:
-            context->rom_memory.current_rom_bank = 1;
+        case ROM_BANK_CODE_512:
+            context->rom_memory.lower_bank = 1;
+            context->rom_memory.upper_bank = 0;
             context->rom_memory.total_rom_banks = 512;
             break;
         default:
-            context->rom_memory.current_rom_bank = 1;
+            context->rom_memory.lower_bank = 1;
+            context->rom_memory.upper_bank = 0;
             context->rom_memory.total_rom_banks = 2;
             break;
     }
 }
 
-static void load_ram_settings(uint16_t hex_code, cartridge_context *context)
+// Loads RAM settings into cart based on provided single byte code.
+static void load_ram_settings(uint16_t hex_code, Cartridge *context)
 {
     switch (hex_code)
     {
-        case 0x00:
+        case RAM_BANK_CODE_NONE:
             context->ram_memory.ram_size = 0;
             context->ram_memory.total_ram_banks = 0;
             context->ram_memory.current_ram_bank = 0;
             break;
-        case 0x01:
+        case RAM_BANK_CODE_UNUSED:
             context->ram_memory.ram_size = 0;
             context->ram_memory.total_ram_banks = 0;
             context->ram_memory.current_ram_bank = 0;
             break;
-        case 0x02:
+        case RAM_BANK_CODE_1:
             context->ram_memory.ram_size = 8000;
             context->ram_memory.total_ram_banks = 1;
             context->ram_memory.current_ram_bank = 1;
             break;
-        case 0x03:
+        case RAM_BANK_CODE_4:
             context->ram_memory.ram_size = 32000;
             context->ram_memory.total_ram_banks = 4;
             context->ram_memory.current_ram_bank = 1;
             break;
-        case 0x04:
+        case RAM_BANK_CODE_16:
             context->ram_memory.ram_size = 128000;
             context->ram_memory.total_ram_banks = 16;
             context->ram_memory.current_ram_bank = 1;
             break;
-        case 0x05:
+        case RAM_BANK_CODE_8:
             context->ram_memory.ram_size = 64000;
             context->ram_memory.total_ram_banks = 8;
             context->ram_memory.current_ram_bank = 1;
@@ -264,47 +400,134 @@ static void load_ram_settings(uint16_t hex_code, cartridge_context *context)
     }
 }
 
-/* Implemented .h functions*/
-
-int init_cartridge(char *file_path)
+// Constructs and returns value based on current upper and lower bits.
+static uint8_t get_current_rom_bank()
 {
-    cartridge_context *context = (cartridge_context*) malloc(sizeof(cartridge_context));
+    return (cart->rom_memory.upper_bank << 5) | (cart->rom_memory.lower_bank);
+}
+
+/* CLIENT (PUBLIC) FUNCTIONS */
+
+int init_cartridge(char *file_path, bool testing)
+{
+    Cartridge *context = (Cartridge*) malloc(sizeof(Cartridge));
     uint8_t *content = get_rom_content(file_path, context);
     context->content = content;
-    // Start collecting ROM header data.
-    load_rom_title(context, content);
-    load_rom_settings(content[0x0148], context);
-    load_ram_settings(content[0x0149], context); 
-    context->header.cgb_flag  = content[0x0143];
-    context->header.nl_code   = (content[0x0144] << 8 | content[0x0145]);
-    context->header.cart_type = content[0x0147];
-    context->header.dest_code = content[0x014A];
-    context->header.ol_code   = content[0x014B];
-    context->header.version   = content[0x014C];
-    context->header.checksum  = content[0x014D];
-    //Tidy Up. TODO: Create a function that does this on exit, as these are needed for execution.
-    cart_context = context;
-    context, content = NULL; // Disarm local pointers.
+    context->banking_mode = ROM_BANK_MODE;
+    context->ram_enable   = true;
+    context->testing      = true;
+    if(!testing)
+    { // Start collecting ROM header data.
+        load_rom_title(context, content);
+        load_rom_settings(content[ROM_SETTINGS_ADDRESS], context);
+        load_ram_settings(content[RAM_SETTINGS_ADDRESS], context); 
+        context->header.cgb_flag  = content[COLOR_MODE_ENABLE_ADDRESS];
+        context->header.nl_code   = (
+            content[NEW_PUBLISHER_ADDRESS]
+            << 8 | // Shift right then bitwise OR.
+            content[MBC_SCHEMA_ADDRESS]
+        );
+        context->header.cart_type = content[MBC_SCHEMA_ADDRESS];
+        context->header.dest_code = content[DESTINATION_ADDRESS];
+        context->header.ol_code   = content[OLD_PUBLISHER_ADDRESS];
+        context->header.version   = content[VERSION_ADDRESS];
+        context->header.checksum  = content[CHECKSUM_ADDRESS];
+    }
+    //Local tidy Up.
+    cart = context;
+    context = NULL;
+    content = NULL;
 }
 
 void print_cartridge_info()
 {
-    // Print header data.
-    printf("Title     = %s\n",   cart_context->header.title);
-    printf("CGB Flag  = %02X\n", cart_context->header.cgb_flag);
-    printf("Publisher = %s\n",   get_publisher_name(cart_context->header.nl_code));
-    printf("Cart Type = %s\n",   get_cartridge_type(cart_context->header.cart_type));
-    printf("Version   = %d\n",   cart_context->header.version);
-    printf("Checksum  = %02X\n", cart_context->header.checksum);
+    printf("General Info:\n");
+    printf("Title        = %s\n"    , cart->header.title);
+    printf("CGB Flag     = %02X\n"  , cart->header.cgb_flag);
+    printf("Publisher    = %s\n"    , get_publisher_name(cart->header.nl_code));
+    printf("Cart Type    = %s\n"    , get_cartridge_type(cart->header.cart_type));
+    printf("Version      = %d\n"    , cart->header.version);
+    printf("Checksum     = %02X\n\n", cart->header.checksum);
+    printf("ROM Info:\n");
+    printf("Size         = %ld\n"   , cart->rom_memory.rom_size);
+    printf("Current Bank = %d\n"    , get_current_rom_bank());
+    printf("Total Banks  = %d\n\n"  , cart->rom_memory.total_rom_banks);
+    printf("RAM Info:\n");
+    printf("Size         = %ld\n"   , cart->ram_memory.ram_size);
+    printf("Current Bank = %d\n"    , cart->ram_memory.current_ram_bank);
+    printf("Total Banks  = %d\n\n"  , cart->ram_memory.total_ram_banks);
 }
 
-// Free memory from global/context.
+uint8_t read_rom_memory(uint16_t address)
+{
+    if (address < BANK_ZERO_ADDRESS)
+    { // Bank 0 Read
+        return cart->content[address];
+    } 
+    if (address < BANK_N_ADDRESS)
+    { // Current Bank Read
+        uint16_t offset = get_current_rom_bank() * ROM_BANK_SIZE;
+        return cart->content[offset + (address - 0x4000)];
+    }
+    return 0xFF;
+}
+
+void write_rom_memory(uint16_t address, uint8_t value) 
+{
+    if     (address <= RAM_ENABLE_ADDRESS)
+    { // RAM Enable
+        switch(value)
+        {
+            case RAM_ENABLED:  
+                cart->ram_enable = value & RAM_ENABLED == RAM_ENABLED;  
+                break;
+            case RAM_DISABLED: 
+                cart->ram_enable = value & RAM_DISABLED == RAM_DISABLED;
+                break;
+        }
+    } 
+    else if(address <= ROM_BANK_SEL_L5_ADDRESS) 
+    { // Select ROM Bank Number (Lower 5 Bits)
+        cart->rom_memory.lower_bank = value & LOWER_5_MASK; 
+    }
+    else if(address <= RAM_BANK_SEL_ADDRESS)
+    { // (RAM Bank Number) OR (Select Upper 2 Bits ROM) 
+        if (cart->banking_mode)
+        { // RAM Banking Mode
+            if (value == 0x00)
+            {
+                cart->ram_memory.current_ram_bank = DEFUALT_RAM_BANK;
+            }
+            else if(value < cart->ram_memory.total_ram_banks) 
+            {
+                cart->ram_memory.current_ram_bank = value;
+            }
+        }
+        else 
+        { // Set Lower 2 Bits (Peform bitshift when calculating ROM Bank)
+            cart->rom_memory.upper_bank = value & LOWER_2_MASK; 
+        }
+    }
+    else if(address <= SET_BANK_MODE_ADDRESS) 
+    { // Banking Mode Select
+        switch(value)
+        {
+            case ROM_BANK_MODE: cart->banking_mode = ROM_BANK_MODE; break;
+            case RAM_BANK_MODE: cart->banking_mode = RAM_BANK_MODE; break;
+        }
+    }
+}
+
+uint16_t get_rom_start()
+{
+    if(cart->testing) return 0x00;
+    return ROM_EXECUTION_ADDRESS;
+}
+
 void tidy_cartridge()
 {
-    // Free content
-    free(cart_context->content);
-    cart_context->content = NULL;
-    // Free context
-    free(cart_context);
-    cart_context = NULL;
+    free(cart->content);
+    cart->content = NULL;
+    free(cart);
+    cart = NULL;
 }
