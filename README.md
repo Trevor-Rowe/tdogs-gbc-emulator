@@ -1,8 +1,8 @@
 # tdogs-gbc-emulator
 **Purpose**
-Want to build an environemnt for Neural Networks to interact with my goal to improve in the following areas:
+Want to build an environemnt for Neural Networks to interact with for educational purposes. Goals:
   * Getting further in touch with my hardware roots:
-    * This is a great project to better master C, developing robust software from the ground up. (C great for prototyping, use Rust for professional and outward facing applications)
+    * This is a great project to better master C, developing robust software from the ground up. (C great for prototyping and performance, use Rust for outward/customer facing applications)
   * Specializing hardware for AI/ML training and development.
   * Data Science Skillet: Model architecture, hypothesis testing, data aquisition, and deployment.
   * Documentation of my thoughts and design choices through the development process.
