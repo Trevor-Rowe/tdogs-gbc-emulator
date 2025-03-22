@@ -17,11 +17,11 @@ the GBC's architeture. Here are some of the critical resources:
 
 **Roadmap (High-Level)**
   1. Encapsulate meta-data and ROM Cartridge behavior.        | *semi-complete*
-  2. Program CPU registers, clock, stack, and OPCode behavior.| *current-step*
-  3. Ensure correct memory mappings.                          | *incomplete*
+  2. Program CPU registers, clock, stack, and OPCode behavior.| *Complete*
+  3. Ensure correct memory mappings.                          | *Complete!*
   4. Audio.                                                   | *incomplete*
-  5. Video.                                                   | *incomplete*
-  6. I/0 and interrupts.                                      | *incomplete*
+  5. Video.                                                   | *Complete!*
+  6. I/0 and interrupts.                                      | *semi-complete*
 
 **Project Structure**
   * roms    -> contains ROM files to be read in and executed by the system.
