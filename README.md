@@ -17,7 +17,7 @@ the GBC's architeture. Here are some of the critical resources:
 
 **Roadmap (High-Level)**
   1. Encapsulate meta-data and ROM Cartridge behavior.        | *semi-complete*
-  2. Program CPU registers, clock, stack, and OPCode behavior.| *Complete*
+  2. Program CPU registers, clock, stack, and OPCode behavior.| *Complete!*
   3. Ensure correct memory mappings.                          | *Complete!*
   4. Audio.                                                   | *incomplete*
   5. Video.                                                   | *Complete!*
