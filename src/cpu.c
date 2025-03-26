@@ -1,17 +1,46 @@
 #include <stdbool.h>
 #include <stdlib.h> 
-#include <stdio.h>
+#include <string.h>
 #include "common.h"
 #include "cpu.h"
-#include "cartridge.h"
+#include "cart.h"
 #include "opcodes.h"
 #include "disassembler.h"
+#include "logger.h"
+#include "mmu.h"
+
+#define LOG_MESSAGE(level, format, ...) log_message(level, __FILE__, __func__, format, ##__VA_ARGS__)
+#define STR_BUFFER_SIZE 128
+
+/* CONSTANTS FOR READABILITY */
+
+typedef enum
+{
+    AF_REG = 0x00,
+    BC_REG = 0x01,
+    DE_REG = 0x02,
+    HL_REG = 0x03
+
+} DualRegister;
+
+/* STATE MANGEMENT */
+
+typedef struct
+{
+    uint8_t   ins_length;
+    bool      ime;
+    bool      ime_scheduled;
+    bool      speed_enabled;
+    bool      cpu_running;
+    bool      halted;
+    bool      halt_bug_active;
+
+} CPU;
 
 /* GLOBAL STATE POINTERS */
 
 static CPU *cpu;
 static Register *R;
-static uint8_t *memory;
 
 /* STATIC (PRIVATE) HELPERS FUNCTIONS */
 
@@ -27,28 +56,28 @@ static void set_flag(bool is_set, Flag flag_mask)
     }
 }
 
-static bool is_flag_set(Flag flag)
+bool is_flag_set(Flag flag)
 {
-    return ((R->F & flag) == flag);
+    return (R->F & flag);
 }
 
 static uint8_t fetch()
 { // Fetch next part of ROM.
-    pulse_clock();
-    uint8_t memory = read_rom_memory(R->PC++);
+    uint8_t rom_byte = *read_memory(R->PC++);
+    LOG_MESSAGE(DEBUG, "%02X", rom_byte);
     cpu->ins_length += 1;
-    //if (cpu->testing) printf("\nFetched %02X from memory address %02X.\n", memory, R->PC);
-    return memory;
+    return rom_byte;
 }
 
 static uint16_t getDR(DualRegister dr)
 {
     switch(dr)
     {
-        case AF_REG: return (R->A << BYTE) | R->F;
-        case BC_REG: return (R->B << BYTE) | R->C;
-        case DE_REG: return (R->D << BYTE) | R->E;
-        case HL_REG: return (R->D << BYTE) | R->E;
+        case AF_REG: return (uint16_t)((R->A << BYTE) | R->F);
+        case BC_REG: return (uint16_t)((R->B << BYTE) | R->C);
+        case DE_REG: return (uint16_t)((R->D << BYTE) | R->E);
+        case HL_REG: return (uint16_t)((R->H << BYTE) | R->L);
+        default: return (uint16_t)((R->H << BYTE) | R->L);
     }
 }
 
@@ -58,7 +87,7 @@ static void setDR(DualRegister dr, uint16_t source)
     {
         case AF_REG:
             R->A = ((uint8_t) (source >> BYTE));
-            R->F = ((uint8_t) source);
+            R->F = ((uint8_t) source);            
             break;
         case BC_REG:
             R->B = ((uint8_t) (source >> BYTE));
@@ -75,70 +104,74 @@ static void setDR(DualRegister dr, uint16_t source)
     }
 }
 
-static void set_stack_pointer(uint16_t address)
-{
-    if (address < HIGH_RAM_ADDRESS_START) address = HIGH_RAM_ADDRESS_END;
-    if (address > HIGH_RAM_ADDRESS_END) address = HIGH_RAM_ADDRESS_END;
-    R->SP = address;
-}
-
 /* CPU OPCODE IMPLEMENTATION  */
-static void no_op()
+static uint8_t nop()
 { // 0x00 | -C
-    /* Implicit pulse_clock() from fetch() */
+    return M2S_RATIO;
 }
-static void halt() 
+static uint8_t halt() 
 { //0x76
-    cpu->cpu_running = false;
-    printf("\nPAUSED\n\n");
+    uint8_t ifr = *read_memory(IF);
+    uint8_t ier = *read_memory(IE);
+    bool pending_interrupts = ifr;
+    bool enabled_interrupts = ifr & ier;
+    if (enabled_interrupts && !cpu->ime)
+    {
+        cpu->halt_bug_active = true; 
+    } 
+    else
+    {
+        cpu->halted = !pending_interrupts;
+    }
+    return M2S_RATIO;
 }
-static void stop()
+static uint8_t stop()
 { // 0x10 (- - - -)
-    fetch();
+    read_memory(R->PC++);
+    if(is_gbc())
+    {
+        uint8_t *key1 = read_memory(KEY1);
+        if (*key1 & BIT_0_MASK)
+        {
+            cpu->speed_enabled = !cpu->speed_enabled;
+            *key1 = (cpu->speed_enabled << 7);
+        }
+    }
+    return M2S_RATIO;
 }
 
-static void reg_ld_16_nn(DualRegister dr)
+static uint8_t reg_ld_16_nn(DualRegister dr)
 { // 0x01 - 0x31
-    uint8_t upper_byte = fetch();
     uint8_t lower_byte = fetch();
-    switch(dr)
-    {
-        case BC_REG: 
-            R->B = upper_byte;
-            R->C = lower_byte;
-            break;
-        case DE_REG: 
-            R->D = upper_byte;
-            R->E = lower_byte;
-            break;
-        case HL_REG:
-            R->H = upper_byte;
-            R->L = lower_byte;
-            break;
-        case SP_REG:
-            set_stack_pointer((upper_byte << BYTE) | lower_byte);
-            break;
-    }
+    uint8_t upper_byte = fetch();
+    setDR(dr, ((upper_byte << BYTE) | lower_byte));
 }
 // Implemented Instructions. (----)
-static void ld_bc_nn()
+static uint8_t ld_bc_nn()
 { // 0x01 | -C
-    reg_ld_16_nn(BC_REG); 
+    reg_ld_16_nn(BC_REG);
+    return 3 * M2S_RATIO;
 }
-static void ld_de_nn()
+static uint8_t ld_de_nn()
 { // 0x11 (- - - -)
-    reg_ld_16_nn(DE_REG); 
+    reg_ld_16_nn(DE_REG);
+    return 3 * M2S_RATIO;
 }
-static void ld_hl_nn()
+static uint8_t ld_hl_nn()
 { // 0x21
     reg_ld_16_nn(HL_REG);
+    return 3 * M2S_RATIO;
+
 }
-static void ld_sp_nn()
+static uint8_t ld_sp_nn()
 { // 0x31
-    reg_ld_16_nn(SP_REG);
+    uint8_t lower_byte = fetch();
+    uint8_t upper_byte = fetch();
+    R->SP = (upper_byte << BYTE) | lower_byte;
+    return 3 * M2S_RATIO;
 }
 
-static void reg_inc_16(DualRegister dr)
+static uint8_t reg_inc_16(DualRegister dr)
 { // 0x03 - 0x33
     switch(dr)
     {
@@ -147,38 +180,38 @@ static void reg_inc_16(DualRegister dr)
             if (!R->C) R->B += 1; 
             break;
         case DE_REG: 
-            R->D += 1;
-            if (!R->D) R->E += 1; 
+            R->E += 1;
+            if (!R->E) R->D += 1; 
             break;
         case HL_REG:
-            R->H += 1;
-            if (!R->H) R->L += 1; 
-            break;
-        case SP_REG:
-            set_stack_pointer(R->SP + 1);
+            R->L += 1;
+            if (!R->L) R->H += 1; 
             break;
     }
-    pulse_clock();
 }
 // Implemented Instructions. (----)
-static void inc_bc()
+static uint8_t inc_bc()
 { //0x03
-    reg_inc_16(BC_REG); 
+    reg_inc_16(BC_REG);
+    return 2 * M2S_RATIO;
 }
-static void inc_de()
+static uint8_t inc_de()
 { // 0x13 
     reg_inc_16(DE_REG);
+    return 2 * M2S_RATIO;
 }
-static void inc_hl()
+static uint8_t inc_hl()
 { // 0x23
-    reg_inc_16(HL_REG);  
+    reg_inc_16(HL_REG);
+    return 2 * M2S_RATIO;
 }
-static void inc_sp()
+static uint8_t inc_sp()
 { 
-    reg_inc_16(SP_REG);
+    R->SP += 1; 
+    return 2 * M2S_RATIO;
 }
 
-static void reg_dec_16(DualRegister dr)
+static uint8_t reg_dec_16(DualRegister dr)
 { // 0x0B - 0x3B
     switch(dr)
     {
@@ -194,451 +227,496 @@ static void reg_dec_16(DualRegister dr)
             R->L -= 1;
             if (R->L == BYTE_UNDERFLOW) R->H -= 1;
             break;
-        case SP_REG:
-            set_stack_pointer(R->SP - 1);
-            break;
     }
-    pulse_clock();
 }
 // Implemented Instructions. (----)
-static void dec_bc()
+static uint8_t dec_bc()
 { // 0x0B | -C
-    reg_dec_16(BC_REG); 
+    reg_dec_16(BC_REG);
+    return 2 * M2S_RATIO;
 }
-static void dec_de()
+static uint8_t dec_de()
 { // 0x1B
     reg_dec_16(DE_REG);
+    return 2 * M2S_RATIO;
 }
-static void dec_hl()
+static uint8_t dec_hl()
 { // 0x2B
-    reg_dec_16(HL_REG); 
+    reg_dec_16(HL_REG);
+    return 2 * M2S_RATIO;
 }
-static void dec_sp()
+static uint8_t dec_sp()
 { 
-    reg_dec_16(SP_REG); 
-}
-
-static uint8_t *read_memory(uint16_t address)
-{
-    pulse_clock();
-    return &(memory[address]);
-}
-
-static void write_memory(uint16_t address, uint8_t value)
-{ // THIS WRITES INTO COMPUTER MEMORY
-    if (address < BANK_N_ADDRESS)
-    {
-        write_rom_memory(address, value);
-    } 
-    else 
-    {
-        memory[address] =  value;
-    }
-    pulse_clock();
-}
-// Implemented Instructions. (----)
-static void ld_bc_a()
-{ // 0x02 | -C
-    write_memory(getDR(BC_REG), R->A);
-}
-static void ld_de_a()
-{ // 
-    write_memory(getDR(DE_REG), R->A); 
-}
-static void ld_hl_b()
-{ // 0x70
-    write_memory(getDR(HL_REG), R->B);
-    pulse_clock();
-}
-static void ld_hl_c()
-{ // 0x71
-    write_memory(getDR(HL_REG), R->C);
-    pulse_clock();
-}
-static void ld_hl_d()
-{ // 0x72
-    write_memory(getDR(HL_REG), R->D);
-    pulse_clock();
-}
-static void ld_hl_e()
-{ // 0x63
-    write_memory(getDR(HL_REG), R->E);
-    pulse_clock();    
-}
-static void ld_hl_h()
-{ // 0x64
-    write_memory(getDR(HL_REG), R->H);
-    pulse_clock();
-}
-static void ld_hl_l()
-{ //0x65
-    write_memory(getDR(HL_REG), R->L);
-    pulse_clock();
-}
-static void ld_hl_a()
-{ //0x77
-    write_memory(getDR(HL_REG), R->A);
-    pulse_clock();   
-}
-static void ld_nn_sp()
-{ // 0x08 | -C
-    uint8_t upper = fetch();
-    uint8_t lower = fetch();
-    write_memory((upper << BYTE | lower), R->SP);
+    R->SP -= 1;
+    return 2 * M2S_RATIO;
 }
 
 static uint8_t pop_stack()
 {
     uint8_t result = *read_memory(R->SP);
-    set_stack_pointer(R->SP + 1);
+    R->SP += 1; 
     return result;
 }
 // Implemented Instructions. (- - - -)
-static void pop_bc()
+static uint8_t pop_bc()
 { // 0xC1
-    uint8_t upper = pop_stack();
-    uint8_t lower = pop_stack();
-    uint16_t result = (upper << BYTE) | lower;
-    setDR(AF_REG, result);  
+    uint16_t lower = pop_stack(); 
+    uint16_t upper = pop_stack(); 
+    uint16_t result = upper << BYTE | lower;
+    setDR(BC_REG, result);
+    return 3 * M2S_RATIO;
 }
-static void pop_de()
+static uint8_t pop_de()
 { // 0xD1
-    uint8_t upper = pop_stack();
-    uint8_t lower = pop_stack();
+    uint8_t lower = pop_stack(); 
+    uint8_t upper = pop_stack(); 
     uint16_t result = (upper << BYTE) | lower;
-    setDR(AF_REG, result);
+    setDR(DE_REG, result);
+    return 3 * M2S_RATIO;
 }
-static void pop_hl()
+static uint8_t pop_hl()
 {  //0xE1
-    uint8_t upper = pop_stack();
     uint8_t lower = pop_stack();
+    uint8_t upper = pop_stack();   
     uint16_t result = (upper << BYTE) | lower;
-    setDR(AF_REG, result);
+    setDR(HL_REG, result);
+    return 3 * M2S_RATIO;
 }
-static void pop_af()
-{ // 0xF1
-    uint8_t upper = pop_stack();
+static uint8_t pop_af()
+{ // 0xF1 (Z, N, C, H)
     uint8_t lower = pop_stack();
+    uint8_t upper = pop_stack();  
     uint16_t result = (upper << BYTE) | lower;
     setDR(AF_REG, result);
+    return 3 * M2S_RATIO;
 }
 
-static void push_stack(uint8_t value)
+static uint8_t push_stack(uint8_t value)
 {
+    R->SP -= 1;
     write_memory(R->SP, value);
-    set_stack_pointer(R->SP - 1);   
 }
 // Implemented Instructions. (- - - -)
-static void push_bc()
-{ // 0xC5
-    push_stack(R->C);
+static uint8_t push_bc()
+{ // 0xC5 
     push_stack(R->B);
-    pulse_clock();
+    push_stack(R->C);
+    return 4 * M2S_RATIO; 
 }
-static void push_de()
+static uint8_t push_de()
 { // 0xD5
-    push_stack(R->E);
-    push_stack(R->D);
-    pulse_clock();
+    push_stack(R->D); 
+    push_stack(R->E); 
+    return 4 * M2S_RATIO;
 }
-static void push_hl()
+static uint8_t push_hl()
 { // 0xE5
-    push_stack(R->L);
     push_stack(R->H);
-    pulse_clock();
+    push_stack(R->L);  
+    return M2S_RATIO;
 }
-static void push_af()
+static uint8_t push_af()
 { // 0xF5
-   push_stack(R->F);
-   push_stack(R->A);
-   pulse_clock();
+    push_stack(R->A); 
+    push_stack(R->F); 
+    return M2S_RATIO;
 }
 
-static void reg_ld_8(uint8_t *r, uint8_t value)
+static uint8_t reg_ld_8(uint8_t *r, uint8_t value)
 { // ~X0-X4 for 4-X-7 
     *r = value; 
 }
 // Implemented Instructions. (----)
-static void ld_a_de()
+static uint8_t ld_a_de()
 { // 0x1A
     R->A = *(read_memory(getDR(DE_REG)));
+    return 2 * M2S_RATIO;
 }
-static void ld_hli_a()
+static uint8_t ld_hli_a()
 { // 0x22
-    uint16_t hl = getDR(hl);
+    uint16_t hl = getDR(HL_REG);
     write_memory(hl, R->A);
     setDR(HL_REG, hl + 1);
+    return 2 * M2S_RATIO;
 }
-static void ld_a_hli()
+static uint8_t ld_a_hli()
 {// 0x2A
     uint16_t hl = getDR(HL_REG);
     R->A = *(read_memory(hl));
     setDR(HL_REG, hl + 1);
+    return 2 * M2S_RATIO;
 }
-static void ld_hld_a()
+static uint8_t ld_hld_a()
 { // 0x32 
     uint16_t hl = getDR(HL_REG);
     write_memory(hl, R->A);
     setDR(HL_REG, hl - 1);
+    return 2 * M2S_RATIO;
 }
-static void ld_a_hld()
+static uint8_t ld_a_hld()
 {
     uint16_t hl = getDR(HL_REG);
     R->A = *(read_memory(hl));
     setDR(HL_REG, hl - 1);
+    return 2 * M2S_RATIO;
 }
-static void ld_hl_n()
+static uint8_t ld_hl_n()
 { // 0x36
     uint8_t n = fetch();
     write_memory(getDR(HL_REG), n);
+    return 3 * M2S_RATIO;
+}
+static uint8_t ld_bc_a()
+{ // 0x02 | -C
+    write_memory(getDR(BC_REG), R->A);
+    return 2 * M2S_RATIO;
+}
+static uint8_t ld_de_a()
+{ // 0x12
+    write_memory(getDR(DE_REG), R->A);
+    return 2 * M2S_RATIO;
+}
+static uint8_t ld_hl_b()
+{ // 0x70
+    write_memory(getDR(HL_REG), R->B);
+    return 2 * M2S_RATIO;
+}
+static uint8_t ld_hl_c()
+{ // 0x71
+    write_memory(getDR(HL_REG), R->C);
+    return 2 * M2S_RATIO;
+}
+static uint8_t ld_hl_d()
+{ // 0x72
+    write_memory(getDR(HL_REG), R->D);
+    return 2 * M2S_RATIO;
+}
+static uint8_t ld_hl_e()
+{ // 0x63
+    write_memory(getDR(HL_REG), R->E);
+    return 2 * M2S_RATIO;
+}
+static uint8_t ld_hl_h()
+{ // 0x64
+    write_memory(getDR(HL_REG), R->H);
+    return 2 * M2S_RATIO;
+}
+static uint8_t ld_hl_l()
+{ //0x65
+    write_memory(getDR(HL_REG), R->L);
+    return 2 * M2S_RATIO;
+}
+static uint8_t ld_hl_a()
+{ //0x77
+    write_memory(getDR(HL_REG), R->A);
+    return 2 * M2S_RATIO;
+}
+static uint8_t ld_nn_sp()
+{ // 0x08 | -C
+    uint8_t lower = fetch();
+    uint8_t upper = fetch();
+    uint16_t address = (upper << BYTE | lower);
+    write_memory(address + 1, (uint8_t) (R->SP >> BYTE));
+    write_memory(address, (uint8_t) (R->SP));
+    return 5 * M2S_RATIO;
 }
 // 0x4X
-static void ld_b_c()
+static uint8_t ld_b_c()
 { //0x41
     reg_ld_8(&(R->B), R->C);
+    return M2S_RATIO;
 }
-static void ld_b_d()
+static uint8_t ld_b_d()
 { // 0x42
     reg_ld_8(&(R->B), R->D);
+    return M2S_RATIO;
 }
-static void ld_b_e()
+static uint8_t ld_b_e()
 { // 0x43
     reg_ld_8(&(R->B), R->E);
+    return M2S_RATIO;
 }
-static void ld_b_h()
+static uint8_t ld_b_h()
 { // 0x44
     reg_ld_8(&(R->B), R->H);
+    return M2S_RATIO;
 }
-static void ld_b_l()
+static uint8_t ld_b_l()
 { // 0x45
     reg_ld_8(&(R->B), R->L);
+    return M2S_RATIO;
 }
-static void ld_b_hl()
+static uint8_t ld_b_hl()
 { // 0x46
     reg_ld_8(&(R->B), *read_memory(getDR(HL_REG)));
-    pulse_clock();
+    return 2 * M2S_RATIO;
 }
-static void ld_b_a()
+static uint8_t ld_b_a()
 { // 0x47
     reg_ld_8(&(R->B), R->A);
+    return M2S_RATIO;
 }
-static void ld_c_b()
+static uint8_t ld_c_b()
 { // 0x48
     reg_ld_8(&(R->C), R->B);
+    return M2S_RATIO;
 }
-static void ld_c_d()
+static uint8_t ld_c_d()
 { // 0x4A
     reg_ld_8(&(R->C), R->D);
+    return M2S_RATIO;
 }
-static void ld_c_e()
+static uint8_t ld_c_e()
 { // 0x4B
     reg_ld_8(&(R->C), R->E);
+    return M2S_RATIO;
 }
-static void ld_c_h()
+static uint8_t ld_c_h()
 { // 0x4C
     reg_ld_8(&(R->C), R->H);
+    return M2S_RATIO;
 }
-static void ld_c_l()
+static uint8_t ld_c_l()
 { // 0x4D
     reg_ld_8(&(R->C), R->L);
+    return M2S_RATIO;
 }
-static void ld_c_hl()
+static uint8_t ld_c_hl()
 { // 0x4E
     reg_ld_8(&(R->C), *read_memory(getDR(HL_REG)));
-    pulse_clock();
+    return 2 * M2S_RATIO;
 }
-static void ld_c_a()
+static uint8_t ld_c_a()
 { // 0x4F
     reg_ld_8(&(R->C), R->A);
+    return M2S_RATIO;
 }
 // 0x5X
-static void ld_d_b()
+static uint8_t ld_d_b()
 { // 0x50
     reg_ld_8(&(R->D), R->B);
+    return M2S_RATIO;
 }
-static void ld_d_c()
+static uint8_t ld_d_c()
 { // 0x51
     reg_ld_8(&(R->D), R->C);
+    return M2S_RATIO;
 }
-static void ld_d_e()
+static uint8_t ld_d_e()
 { // 0x53
-    reg_ld_8(&(R->D), R->D);
+    reg_ld_8(&(R->D), R->E);
+    return M2S_RATIO;
 }
-static void ld_d_h()
+static uint8_t ld_d_h()
 { // 0x54
     reg_ld_8(&(R->D), R->H);
+    return M2S_RATIO;
 }
-static void ld_d_l()
+static uint8_t ld_d_l()
 { // 0x55
     reg_ld_8(&(R->D), R->L);
+    return M2S_RATIO;
 }
-static void ld_d_hl()
+static uint8_t ld_d_hl()
 { // 0x56
     reg_ld_8(&(R->D), *read_memory(getDR(HL_REG)));
-    pulse_clock();
+    return 2 * M2S_RATIO;
 }
-static void ld_d_a()
+static uint8_t ld_d_a()
 { // 0x57
     reg_ld_8(&(R->D), R->A);
+    return M2S_RATIO;
 }
-static void ld_e_b()
+static uint8_t ld_e_b()
 { // 0x58
     reg_ld_8(&(R->E), R->B);
+    return M2S_RATIO;
 }
-static void ld_e_c()
+static uint8_t ld_e_c()
 { // 0x59
     reg_ld_8(&(R->E), R->C);
+    return M2S_RATIO;
 }
-static void ld_e_d()
+static uint8_t ld_e_d()
 { // 0x5A
     reg_ld_8(&(R->E), R->D);
+    return M2S_RATIO;
 }
-static void ld_e_h()
+static uint8_t ld_e_h()
 { // 0x5C
     reg_ld_8(&(R->E), R->H);
+    return M2S_RATIO;
 }
-static void ld_e_l()
+static uint8_t ld_e_l()
 { // 0x5D
     reg_ld_8(&(R->E), R->L);
+    return M2S_RATIO;
 }
-static void ld_e_hl()
+static uint8_t ld_e_hl()
 { // 0x5E
     reg_ld_8(&(R->E), *read_memory(getDR(HL_REG)));
-    pulse_clock();
+    return 2 * M2S_RATIO;
 }
-static void ld_e_a()
+static uint8_t ld_e_a()
 { // 0x5F
     reg_ld_8(&(R->E), R->A);
+    return M2S_RATIO;
 }
 // 0x6X
-static void ld_h_b()
+static uint8_t ld_h_b()
 { // 0x6A
     reg_ld_8(&(R->H), R->B);
+    return M2S_RATIO;
 }
-static void ld_h_c()
+static uint8_t ld_h_c()
 { //0x61
     reg_ld_8(&(R->H), R->C);
+    return M2S_RATIO;
 }
-static void ld_h_d()
+static uint8_t ld_h_d()
 { // 0x62
     reg_ld_8(&(R->H), R->D);
+    return M2S_RATIO;
 }
-static void ld_h_e()
+static uint8_t ld_h_e()
 { // 0x63
     reg_ld_8(&(R->H), R->E);
+    return M2S_RATIO;
 }
-static void ld_h_l()
+static uint8_t ld_h_l()
 { // 0x65
     reg_ld_8(&(R->H), R->L);
+    return M2S_RATIO;
 }
-static void ld_h_hl()
+static uint8_t ld_h_hl()
 { // 0x66
     reg_ld_8(&(R->H), *read_memory(getDR(HL_REG)));
-    pulse_clock();
+    return 2 * M2S_RATIO;
 }
-static void ld_h_a()
+static uint8_t ld_h_a()
 { // 0x67
     reg_ld_8(&(R->H), R->A);
+    return M2S_RATIO;
 }
-static void ld_l_b()
+static uint8_t ld_l_b()
 { // 0x68
     reg_ld_8(&(R->L), R->B);
+    return M2S_RATIO;
 }
-static void ld_l_c()
+static uint8_t ld_l_c()
 { // 0x69
     reg_ld_8(&(R->L), R->C);
+    return M2S_RATIO;
 }
-static void ld_l_d()
+static uint8_t ld_l_d()
 { //0x6A
     reg_ld_8(&(R->L), R->D);
+    return M2S_RATIO;
 }
-static void ld_l_e()
+static uint8_t ld_l_e()
 { //0x6B
     reg_ld_8(&(R->L), R->E);
+    return M2S_RATIO;
 }
-static void ld_l_h()
+static uint8_t ld_l_h()
 { //0x6C
     reg_ld_8(&(R->L), R->H);
+    return M2S_RATIO;
 }
-static void ld_l_hl()
+static uint8_t ld_l_hl()
 { // 0x6E
     reg_ld_8(&(R->L), *read_memory(getDR(HL_REG)));
-    pulse_clock();
+    return 2 * M2S_RATIO;
 }
-static void ld_l_a()
+static uint8_t ld_l_a()
 { //0x6F
     reg_ld_8(&(R->L), R->A);
+    return M2S_RATIO;
 }
 // 0x7X
-static void ld_a_b()
+static uint8_t ld_a_b()
 { // 0x78
     reg_ld_8(&(R->A), R->B);
+    return M2S_RATIO;
 }
-static void ld_a_c()
+static uint8_t ld_a_c()
 { // 0x79
     reg_ld_8(&(R->A), R->C);
+    return M2S_RATIO;
 }
-static void ld_a_d()
+static uint8_t ld_a_d()
 { // 0x7A
     reg_ld_8(&(R->A), R->D);
+    return M2S_RATIO;
 }
-static void ld_a_e()
+static uint8_t ld_a_e()
 { // 0x7B
-    reg_ld_8(&(R->A), R->B);
+    reg_ld_8(&(R->A), R->E);
+    return M2S_RATIO;
 }
-static void ld_a_h()
+static uint8_t ld_a_h()
 { // 0x7C
     reg_ld_8(&(R->A), R->H);
+    return M2S_RATIO;
 }
-static void ld_a_l()
+static uint8_t ld_a_l()
 { // 0x7D
     reg_ld_8(&(R->A), R->L);
+    return M2S_RATIO;
 }
-static void ld_a_hl()
+static uint8_t ld_a_hl()
 { // 0x7E
     reg_ld_8(&(R->A), *read_memory(getDR(HL_REG)));
-    pulse_clock();
+    return 2 * M2S_RATIO;
 }
-static void ld_a_bc()
+static uint8_t ld_a_bc()
 { // 0x0A | -C
     reg_ld_8(&(R->A), *read_memory(getDR(BC_REG)));
+    return 2 * M2S_RATIO;
 }
 
-static void reg_ld_8_n(uint8_t *r)
+static uint8_t reg_ld_8_n(uint8_t *r)
 { // 0x06 - 0x36 AND 0x0A - 0x3A
      *r = fetch();
 }
 // Implemented Functions. (- - - -)
-static void ld_b_n()
+static uint8_t ld_b_n()
 { // 0x06 | -C
     reg_ld_8_n(&(R->B));
+    return 2 * M2S_RATIO;
 }
-static void ld_d_n()
+static uint8_t ld_d_n()
 { // 0x16 | -C
     reg_ld_8_n(&(R->D));
+    return 2 * M2S_RATIO;
 }
-static void ld_h_n()
+static uint8_t ld_h_n()
 { // 0x26 | -C
     reg_ld_8_n(&(R->H));
+    return 2 * M2S_RATIO;
 }
-static void ld_c_n()
+static uint8_t ld_c_n()
 { // 0x0E | -C
     reg_ld_8_n(&(R->C));
+    return 2 * M2S_RATIO;
 }
-static void ld_e_n()
+static uint8_t ld_e_n()
 { // 0x1E | -C
     reg_ld_8_n(&(R->E));
+    return 2 * M2S_RATIO;
 }
-static void ld_l_n()
+static uint8_t ld_l_n()
 { // 0x2E | -C
     reg_ld_8_n(&(R->L));
+    return 2 * M2S_RATIO;
 }
-static void ld_a_n()
+static uint8_t ld_a_n()
 { // 0x3E | -C
     reg_ld_8_n(&(R->A));
+    return 2 * M2S_RATIO;
 }
 
-static void reg_inc_8(uint8_t *r)
+static uint8_t reg_inc_8(uint8_t *r)
 { // 0x04 - 0x34 AND 0x0C - 0x3C
     uint8_t result = *r + 1;
     bool is_zero = !((bool) result);
@@ -646,109 +724,143 @@ static void reg_inc_8(uint8_t *r)
     set_flag(is_zero, ZERO_FLAG);
     set_flag(false, SUBTRACT_FLAG);
     set_flag(hc_exists, HALF_CARRY_FLAG);
+    *r = result;
 }
 // Implemented Functions. (Z 0 H -)
-static void inc_b()
+static uint8_t inc_b()
 { // 0x04 | -C
     reg_inc_8(&(R->B));
+    return M2S_RATIO;
 }
-static void inc_d()
+static uint8_t inc_d()
 { // 0x14 | -C
     reg_inc_8(&(R->D));
+    return M2S_RATIO;
 }
-static void inc_h()
+static uint8_t inc_h()
 { // 0x24 | -C
     reg_inc_8(&(R->H));
+    return M2S_RATIO;
 }
-static void inc_hl_mem()
+static uint8_t inc_hl_mem()
 { // 0x34 | -C
     uint8_t *value = read_memory(getDR(HL_REG));
     reg_inc_8(value); 
+    return 3 * M2S_RATIO;
 }
-static void inc_c()
+static uint8_t inc_c()
 { // 0x0C | -C
     reg_inc_8(&(R->C));
+    return M2S_RATIO;
 }
-static void inc_e()
+static uint8_t inc_e()
 { // 0x1C | -C
     reg_inc_8(&(R->E));
+    return M2S_RATIO;
 }
-static void inc_l()
+static uint8_t inc_l()
 { // 0x2C | -C
     reg_inc_8(&(R->L));
+    return M2S_RATIO;
 }
-static void inc_a()
+static uint8_t inc_a()
 { // 0x3C | -C
     reg_inc_8(&(R->A));
+    return M2S_RATIO;
 }
 
-static void reg_dec_8(uint8_t *r)
-{ // 0x05 - 0x35 AND 0x0B - 0x3B
+static uint8_t reg_dec_8(uint8_t *r)
+{ // 0x05 - 0x35 AND 0x0D - 0x3D
     uint8_t result = *r - 1;
     bool is_zero = !((bool) result);
     bool hc_exists = (*r & LOWER_4_MASK) == IS_ZERO;
     set_flag(is_zero, ZERO_FLAG);
     set_flag(true, SUBTRACT_FLAG);
     set_flag(hc_exists, HALF_CARRY_FLAG);
+    *r = result;
 }
 // Implemented Functions. (Z 1 H -)
-static void dec_b()
+static uint8_t dec_b()
 { // 0x05 | -C
     reg_dec_8(&(R->B));
+    return M2S_RATIO;
 }
-static void dec_d()
+static uint8_t dec_d()
 { // 0x15 | -C
     reg_dec_8(&(R->D));
+    return M2S_RATIO;
 }
-static void dec_h()
+static uint8_t dec_h()
 { // 0x25 | -C
     reg_dec_8(&(R->H));
+    return M2S_RATIO;
 }
-static void dec_hl_mem()
+static uint8_t dec_hl_mem()
 { // 0x35 | -C
     uint8_t *value = read_memory(getDR(HL_REG));
-    reg_dec_8(value);
+    write_memory(getDR(HL_REG), *value - 1);
+    return 3 * M2S_RATIO;
 }
-static void dec_c()
+static uint8_t dec_c()
 { // 0x0D | -C
     reg_dec_8(&(R->C));
+    return M2S_RATIO;
 }
-static void dec_e()
+static uint8_t dec_e()
 { // 0x1D | -C
     reg_dec_8(&(R->E));
+    return M2S_RATIO;
 }
-static void dec_l()
+static uint8_t dec_l()
 { // 0x2D | -C
     reg_dec_8(&(R->L));
+    return M2S_RATIO;
 }
-static void dec_a()
+static uint8_t dec_a()
 { // 0x3D | -C
     reg_dec_8(&(R->A));
+    return M2S_RATIO;
 }
 
-static void rla()
-{ // 0x17 (- - - C)
-    bool c_exists = R->A & BIT_7_MASK == BIT_7_MASK;
-    set_flag(c_exists, CARRY_FLAG);
-    R->A = (R->A << 1);
-}
-static void rlca()
-{ // 0x07 (- - - C) | -C
+static uint8_t rla()
+{ // 0x17 (0 0 0 C)
     bool c_exists = R->A & BIT_7_MASK;
+    R->A = (R->A << 1) | is_flag_set(CARRY_FLAG);
+    set_flag(false, ZERO_FLAG);
+    set_flag(false, SUBTRACT_FLAG);
+    set_flag(false, HALF_CARRY_FLAG);
     set_flag(c_exists, CARRY_FLAG);
-    R->A = ((R->A << 7) | (R->A >> 1));
+    return M2S_RATIO;
 }
-static void rrca()
-{ // 0x0F (- - - C) | -C
+static uint8_t rlca()
+{ // 0x07 (0 0 0 C) | -C
+    bool c_exists = R->A & BIT_7_MASK;
+    R->A = ((R->A >> 7) | (R->A << 1));
+    set_flag(false, ZERO_FLAG);
+    set_flag(false, SUBTRACT_FLAG);
+    set_flag(false, HALF_CARRY_FLAG);
+    set_flag(c_exists, CARRY_FLAG);
+    return M2S_RATIO;
+}
+static uint8_t rrca()
+{ // 0x0F (0 0 0 C) | -C
     bool c_exists = R->A & BIT_0_MASK;
-    set_flag(c_exists, CARRY_FLAG);
     R->A = ((R->A << 7) | (R->A >> 1));
-}
-static void rra()
-{ // 0x1F (- - - C)
-    bool c_exists = (R->A & BIT_0_MASK) == BIT_0_MASK;
+    set_flag(false, ZERO_FLAG);
+    set_flag(false, SUBTRACT_FLAG);
+    set_flag(false, HALF_CARRY_FLAG);
     set_flag(c_exists, CARRY_FLAG);
-    R->A = R->A >> 1;
+    return M2S_RATIO;
+}
+static uint8_t rra()
+{ // 0x1F (0 0 0 C)
+    bool c_exists = (R->A & BIT_0_MASK);
+    R->A = R->A >> 1 | (is_flag_set(CARRY_FLAG) << 7);
+    set_flag(false, ZERO_FLAG);
+    set_flag(false, SUBTRACT_FLAG);
+    set_flag(false, HALF_CARRY_FLAG);
+    set_flag(c_exists, CARRY_FLAG);
+    return M2S_RATIO;
 }
 
 static uint16_t reg_add_16(uint16_t dest, uint16_t source)
@@ -760,39 +872,43 @@ static uint16_t reg_add_16(uint16_t dest, uint16_t source)
     set_flag(false, SUBTRACT_FLAG);
     set_flag(hc_exists, HALF_CARRY_FLAG);
     set_flag(c_exists, CARRY_FLAG);
-    pulse_clock();
+    uint16_t result = dest + source;
     return (uint16_t) (dest + source);
 }
 // Implemented Functions (- 0 H C)
-static void add_hl_bc()
+static uint8_t add_hl_bc()
 { // 0x09 | -C
     uint16_t result = reg_add_16(getDR(HL_REG), getDR(BC_REG));
     setDR(HL_REG, result);
+    return 2 * M2S_RATIO;
 }
-static void add_hl_de()
+static uint8_t add_hl_de()
 { // 0x19 | -C
     uint16_t result = reg_add_16(getDR(HL_REG), getDR(DE_REG));
     setDR(HL_REG, result);
+    return 2 * M2S_RATIO;
 }
-static void add_hl_hl()
+static uint8_t add_hl_hl()
 { // 0x29 | -C
     uint16_t result = reg_add_16(getDR(HL_REG), getDR(HL_REG));
     setDR(HL_REG, result);
+    return 2 * M2S_RATIO;
 }
-static void add_hl_sp()
+static uint8_t add_hl_sp()
 { // 0x39 | -C
     uint16_t result = reg_add_16(getDR(HL_REG), R->SP);
     setDR(HL_REG, result);
+    return 2 * M2S_RATIO;
 }
 
 static uint8_t reg_add_8(uint8_t dest, uint8_t source, bool carry)
 { // 0x8X
-    uint16_t result = dest + source + carry;
+    uint8_t result = dest + source + carry;
     bool is_zero = !((bool) result);
     bool hc_exists = 
     (dest & LOWER_4_MASK) + 
     (source & LOWER_4_MASK + carry) > LOWER_4_MASK;
-    bool c_exists = result > MAX_INT_8;
+    bool c_exists = (dest + source + carry) > MAX_INT_8;
     set_flag(is_zero, ZERO_FLAG);
     set_flag(false, SUBTRACT_FLAG);
     set_flag(hc_exists, HALF_CARRY_FLAG);
@@ -800,95 +916,122 @@ static uint8_t reg_add_8(uint8_t dest, uint8_t source, bool carry)
     return (uint8_t) result;
 }
 // Implemented Functions. (Z 0 H C)
-static void add_a_b()
+static uint8_t add_a_b()
 { // 0x80
     uint8_t result = reg_add_8(R->A, R->B, false);
     R->A = result;
+    return M2S_RATIO;
 }
-static void add_a_c()
+static uint8_t add_a_c()
 { // 0x81
     uint8_t result = reg_add_8(R->A, R->C, false);
     R->A = result;
+    return M2S_RATIO;
 }
-static void add_a_d()
+static uint8_t add_a_d()
 { // 0x82
     uint8_t result = reg_add_8(R->A, R->D, false);
     R->A = result;
+    return M2S_RATIO;
 }
-static void add_a_e()
+static uint8_t add_a_e()
 { // 0x83
     uint8_t result = reg_add_8(R->A, R->E, false);
     R->A = result;
+    return M2S_RATIO;
 }
-static void add_a_h()
+static uint8_t add_a_h()
 { // 0x84
     uint8_t result = reg_add_8(R->A, R->H, false);
     R->A = result;
+    return M2S_RATIO;
 }
-static void add_a_l()
+static uint8_t add_a_l()
 { // 0x85
     uint8_t result = reg_add_8(R->A, R->L, false);
     R->A = result;
+    return M2S_RATIO;
 }
-static void add_a_hl()
+static uint8_t add_a_hl()
 { // 0x86
     uint8_t result = reg_add_8(R->A, *read_memory(getDR(HL_REG)), false);
     R->A = result;
+    return 2 * M2S_RATIO;
 }
-static void add_a_a()
-{ 
+static uint8_t add_a_a()
+{ // 0x87
     uint8_t result = reg_add_8(R->A, R->A, false);
     R->A = result;
+    return M2S_RATIO;
 }
-static void adc_a_b()
+static uint8_t adc_a_b()
 {  // 0x88
-    uint8_t result = reg_add_8(R->A, R->B, true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t result = reg_add_8(R->A, R->B, c_exists);
     R->A = result;
+    return M2S_RATIO;
 }
-static void adc_a_c()
+static uint8_t adc_a_c()
 { // 0x89
-    uint8_t result = reg_add_8(R->A, R->C, true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t result = reg_add_8(R->A, R->C, c_exists);
     R->A = result;
+    return M2S_RATIO;
 }
-static void adc_a_d()
+static uint8_t adc_a_d()
 { // 0x8A
-    uint8_t result = reg_add_8(R->A, R->D, true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t result = reg_add_8(R->A, R->D, c_exists);
     R->A = result;
+    return M2S_RATIO;
 }
-static void adc_a_e()
+static uint8_t adc_a_e()
 { // 0x8B
-    uint8_t result = reg_add_8(R->A, R->E, true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t result = reg_add_8(R->A, R->E, c_exists);
     R->A = result;
+    return M2S_RATIO;
 }
-static void adc_a_h()
+static uint8_t adc_a_h()
 { // 0x8C
-    uint8_t result = reg_add_8(R->A, R->H, true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t result = reg_add_8(R->A, R->H, c_exists);
     R->A = result;
+    return M2S_RATIO;
 }
-static void adc_a_l()
+static uint8_t adc_a_l()
 { // 0x8D
-    uint8_t result = reg_add_8(R->A, R->L, true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t result = reg_add_8(R->A, R->L, c_exists);
     R->A = result;
+    return M2S_RATIO;
 }
-static void adc_a_hl()
+static uint8_t adc_a_hl()
 { // 0x8E
-    uint8_t result = reg_add_8(R->A, getDR(HL_REG), true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t result = reg_add_8(R->A, *read_memory(getDR(HL_REG)), c_exists);
     R->A = result;
+    return 2 * M2S_RATIO;
 }
-static void adc_a_a()
+static uint8_t adc_a_a()
 { // 0x8F
-    uint8_t result = reg_add_8(R->A, R->A, true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t result = reg_add_8(R->A, R->A, c_exists);
     R->A = result;
+    return M2S_RATIO;
 }
-static void add_a_n()
+static uint8_t add_a_n()
 { // 0xC6
-   uint8_t result = reg_add_8(R->A, fetch(), false);
-   R->A = result;
-}
-static void adc_a_n()
-{ // 0xCE
-    uint8_t result = reg_add_8(R->A, fetch(), true);
+    uint8_t result = reg_add_8(R->A, fetch(), false);
     R->A = result;
+    return 2 * M2S_RATIO;
+}
+static uint8_t adc_a_n()
+{ // 0xCE
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t result = reg_add_8(R->A, fetch(), c_exists);
+    R->A = result;
+    return 2 * M2S_RATIO;
 }
 
 static uint8_t reg_sub_8(uint8_t dest, uint8_t source, bool carry)
@@ -904,95 +1047,122 @@ static uint8_t reg_sub_8(uint8_t dest, uint8_t source, bool carry)
     return result;
 }
 // Implemented Functions. (Z 1 H C)
-static void sub_a_b()
+static uint8_t sub_a_b()
 { // 0x90
     uint8_t diff = reg_sub_8(R->A, R->B, false);
     R->A = diff;
+    return M2S_RATIO;
 }
-static void sub_a_c()
+static uint8_t sub_a_c()
 { // 0x91
      uint8_t diff = reg_sub_8(R->A, R->C, false);
     R->A = diff;
+    return M2S_RATIO;
 }
-static void sub_a_d()
+static uint8_t sub_a_d()
 { // 0x92
     uint8_t diff = reg_sub_8(R->A, R->D, false);
     R->A = diff;
+    return M2S_RATIO;
 }
-static void sub_a_e()
+static uint8_t sub_a_e()
 { // 0x93
     uint8_t diff = reg_sub_8(R->A, R->E, false);
     R->A = diff;
+    return M2S_RATIO;
 }
-static void sub_a_h()
+static uint8_t sub_a_h()
 { // 0x94
     uint8_t diff = reg_sub_8(R->A, R->H, false);
     R->A = diff;
+    return M2S_RATIO;
 }
-static void sub_a_l()
+static uint8_t sub_a_l()
 { // 0x95
     uint8_t diff = reg_sub_8(R->A, R->L, false);
     R->A = diff;
+    return M2S_RATIO;
 }
-static void sub_a_hl()
+static uint8_t sub_a_hl()
 { // 0x96
     uint8_t diff = reg_sub_8(R->A, *read_memory(getDR(HL_REG)), false);
     R->A = diff;
+    return 2 * M2S_RATIO;    
 }
-static void sub_a_a()
+static uint8_t sub_a_a()
 { // 0x97
     uint8_t diff = reg_sub_8(R->A, R->A, false);
     R->A = diff;
+    return M2S_RATIO;
 }
-static void sbc_a_b()
+static uint8_t sbc_a_b()
 { // 0x98
-    uint8_t diff = reg_sub_8(R->A, R->B, true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t diff = reg_sub_8(R->A, R->B, c_exists);
     R->A = diff;
+    return M2S_RATIO;
 }
-static void sbc_a_c()
+static uint8_t sbc_a_c()
 { // 0x99
-    uint8_t diff = reg_sub_8(R->A, R->C, true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t diff = reg_sub_8(R->A, R->C, c_exists);
     R->A = diff;
+    return M2S_RATIO;
 }
-static void sbc_a_d()
+static uint8_t sbc_a_d()
 { // 0x9A
-    uint8_t diff = reg_sub_8(R->A, R->D, true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t diff = reg_sub_8(R->A, R->D, c_exists);
     R->A = diff;
+    return M2S_RATIO;
 }
-static void sbc_a_e()
+static uint8_t sbc_a_e()
 { // 0x9B
-    uint8_t diff = reg_sub_8(R->A, R->E, true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t diff = reg_sub_8(R->A, R->E, c_exists);
     R->A = diff;
+    return M2S_RATIO;
 }
-static void sbc_a_h()
+static uint8_t sbc_a_h()
 { // 0x9C
-    uint8_t diff = reg_sub_8(R->A, R->H, true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t diff = reg_sub_8(R->A, R->H, c_exists);
     R->A = diff;
+    return M2S_RATIO;
 }
-static void sbc_a_l()
+static uint8_t sbc_a_l()
 { // 0x9D
-    uint8_t diff = reg_sub_8(R->A, R->L, true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t diff = reg_sub_8(R->A, R->L, c_exists);
     R->A = diff;
+    return M2S_RATIO;
 }
-static void sbc_a_hl()
+static uint8_t sbc_a_hl()
 { // 0x9E
-    uint8_t diff = reg_sub_8(R->A, *read_memory(getDR(HL_REG)), true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t diff = reg_sub_8(R->A, *read_memory(getDR(HL_REG)), c_exists);
     R->A = diff;
+    return 2 * M2S_RATIO;
 }
-static void sbc_a_a()
+static uint8_t sbc_a_a()
 { // 0x9F
-    uint8_t diff = reg_sub_8(R->A, R->A, true);
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t diff = reg_sub_8(R->A, R->A, c_exists);
     R->A = diff;
+    return M2S_RATIO;
 }
-static void sub_a_n()
+static uint8_t sub_a_n()
 { // 0xD6
     uint8_t result = reg_sub_8(R->A, fetch(), false);
     R->A = result;
+    return 2 * M2S_RATIO;
 }
-static void sbc_a_n()
+static uint8_t sbc_a_n()
 { // 0xDE
-    uint8_t result = reg_sub_8(R->A, fetch(), true);
-    R->A = result;   
+    bool c_exists = is_flag_set(CARRY_FLAG);
+    uint8_t result = reg_sub_8(R->A, fetch(), c_exists);
+    R->A = result;
+    return 2 * M2S_RATIO;  
 }
 
 static uint8_t reg_and_8(uint8_t dest, uint8_t source)
@@ -1006,50 +1176,59 @@ static uint8_t reg_and_8(uint8_t dest, uint8_t source)
     return result;
 }
 // Implemented Functions. (Z 0 1 0)
-static void and_a_b()
+static uint8_t and_a_b()
 { // 0xA0
     uint8_t result = reg_and_8(R->A, R->B);
-    R->A = result; 
+    R->A = result;
+    return M2S_RATIO;
 }
-static void and_a_c()
+static uint8_t and_a_c()
 { // 0xA1
     uint8_t result = reg_and_8(R->A, R->C);
-    R->A = result; 
+    R->A = result;
+    return M2S_RATIO;
 }
-static void and_a_d()
+static uint8_t and_a_d()
 { // 0xA2
     uint8_t result = reg_and_8(R->A, R->D);
-    R->A = result; 
+    R->A = result;
+    return M2S_RATIO;
 }
-static void and_a_e()
+static uint8_t and_a_e()
 { // 0xA3
     uint8_t result = reg_and_8(R->A, R->E);
-    R->A = result; 
+    R->A = result;
+    return M2S_RATIO; 
 }
-static void and_a_h()
+static uint8_t and_a_h()
 { // 0xA4
     uint8_t result = reg_and_8(R->A, R->H);
-    R->A = result; 
+    R->A = result;
+    return M2S_RATIO; 
 }
-static void and_a_l()
+static uint8_t and_a_l()
 { // 0xA5
     uint8_t result = reg_and_8(R->A, R->L);
-    R->A = result; 
+    R->A = result;
+    return M2S_RATIO;
 }
-static void and_a_hl()
+static uint8_t and_a_hl()
 { // 0xA6
     uint8_t result = reg_and_8(R->A, *read_memory(getDR(HL_REG)));
     R->A = result; 
+    return 2 * M2S_RATIO;
 }
-static void and_a_a()
+static uint8_t and_a_a()
 { // 0xA7
     uint8_t result = reg_and_8(R->A, R->A);
-    R->A = result; 
+    R->A = result;
+    return M2S_RATIO; 
 }
-static void and_a_n()
+static uint8_t and_a_n()
 { // 0xE6
     uint8_t result = reg_and_8(R->A, fetch());
     R->A = result;
+    return 2 * M2S_RATIO;
 }
 
 static uint8_t reg_xor_8(uint8_t dest, uint8_t source)
@@ -1060,52 +1239,62 @@ static uint8_t reg_xor_8(uint8_t dest, uint8_t source)
     set_flag(false, SUBTRACT_FLAG);
     set_flag(false, HALF_CARRY_FLAG);
     set_flag(false, CARRY_FLAG);
+    return result;
 }
 // Implemented Functions. (Z 0 0 0)
-static void xor_a_b()
+static uint8_t xor_a_b()
 { // 0xA8
     uint8_t result = reg_xor_8(R->A, R->B);
     R->A = result;
+    return M2S_RATIO;
 }
-static void xor_a_c()
+static uint8_t xor_a_c()
 { // 0xA9
     uint8_t result = reg_xor_8(R->A, R->C);
     R->A = result;
+    return M2S_RATIO;
 }
-static void xor_a_d()
+static uint8_t xor_a_d()
 { // 0xAA
     uint8_t result = reg_xor_8(R->A, R->D);
     R->A = result;
+    return M2S_RATIO;
 }
-static void xor_a_e()
+static uint8_t xor_a_e()
 { // 0xAB
     uint8_t result = reg_xor_8(R->A, R->E);
     R->A = result;
+    return M2S_RATIO;
 }
-static void xor_a_h()
+static uint8_t xor_a_h()
 { // 0xAC
     uint8_t result = reg_xor_8(R->A, R->H);
     R->A = result;
+    return M2S_RATIO;
 }
-static void xor_a_l()
+static uint8_t xor_a_l()
 { // 0x7D
     uint8_t result = reg_xor_8(R->A, R->L);
     R->A = result;
+    return M2S_RATIO;
 }
-static void xor_a_hl()
+static uint8_t xor_a_hl()
 { // 0xAE
     uint8_t result = reg_xor_8(R->A, *read_memory(getDR(HL_REG)));
     R->A = result;
+    return 2 * M2S_RATIO;
 }
-static void xor_a_a()
+static uint8_t xor_a_a()
 { // 0xAF
     uint8_t result = reg_xor_8(R->A, R->A);
     R->A = result;
+    return M2S_RATIO;
 }
-static void xor_a_n()
+static uint8_t xor_a_n()
 { // 0xEE
     uint8_t result = reg_xor_8(R->A, fetch());
     R->A = result;
+    return 2 * M2S_RATIO;
 }
 
 static uint8_t reg_or_8(uint8_t dest, uint8_t source)
@@ -1119,56 +1308,64 @@ static uint8_t reg_or_8(uint8_t dest, uint8_t source)
     return result;
 }
 // Implemented Functions. (Z 0 0 0)
-static void or_a_b()
+static uint8_t or_a_b()
 { // 0xB0
     uint8_t result = reg_or_8(R->A, R->B);
     R->A = result;
+    return M2S_RATIO;
 }
-static void or_a_c()
+static uint8_t or_a_c()
 { // 0xB1
     uint8_t result = reg_or_8(R->A, R->C);
     R->A = result;
+    return M2S_RATIO;
 }
-static void or_a_d()
+static uint8_t or_a_d()
 { // 0xB2
     uint8_t result = reg_or_8(R->A, R->D);
     R->A = result;
+    return M2S_RATIO;
 }
-static void or_a_e()
+static uint8_t or_a_e()
 { // 0xB3
     uint8_t result = reg_or_8(R->A, R->E);
     R->A = result;
+    return M2S_RATIO;
 }
-static void or_a_h()
+static uint8_t or_a_h()
 { // 0xB4
     uint8_t result = reg_or_8(R->A, R->H);
     R->A = result;
+    return M2S_RATIO;
 }
-static void or_a_l()
+static uint8_t or_a_l()
 { // 0xB5
     uint8_t result = reg_or_8(R->A, R->L);
     R->A = result;
+    return M2S_RATIO;
 }
-static void or_a_hl()
+static uint8_t or_a_hl()
 { // 0xB6
     uint8_t result = reg_or_8(R->A, *read_memory(getDR(HL_REG)));
     R->A = result;
+    return 2 * M2S_RATIO;
 }
-static void or_a_a()
+static uint8_t or_a_a()
 { // 0xB7
     uint8_t result = reg_or_8(R->A, R->A);
     R->A = result;
+    return M2S_RATIO;
 }
-static void or_a_n()
+static uint8_t or_a_n()
 { // 0xF6
     uint8_t result = reg_or_8(R->A, fetch());
     R->A = result;
+    return 2 * M2S_RATIO;
 }
 
-static void reg_cp_8(uint8_t dest, uint8_t source)
+static uint8_t reg_cp_8(uint8_t dest, uint8_t source)
 { // 0xB8 - 0xBF
-    uint8_t result = dest - source;
-    bool is_zero = !((bool) result);
+    bool is_zero = dest == source;
     bool hc_exists = (dest & LOWER_4_MASK) < (source & LOWER_4_MASK);
     bool c_exists = dest < source;
     set_flag(is_zero, ZERO_FLAG);
@@ -1177,404 +1374,487 @@ static void reg_cp_8(uint8_t dest, uint8_t source)
     set_flag(c_exists, CARRY_FLAG);
 }
 // Implemented Functions. (Z 1 H C)
-static void cp_a_b()
+static uint8_t cp_a_b()
 { // 0xB8
     reg_cp_8(R->A, R->B);
+    return M2S_RATIO;
 }
-static void cp_a_c()
+static uint8_t cp_a_c()
 { // 0xB9
     reg_cp_8(R->A, R->C);
+    return M2S_RATIO;
 }
-static void cp_a_d()
+static uint8_t cp_a_d()
 { // 0xBA
     reg_cp_8(R->A, R->D);
+    return M2S_RATIO;
 }
-static void cp_a_e()
+static uint8_t cp_a_e()
 { // 0xBB
     reg_cp_8(R->A, R->E);
+    return M2S_RATIO;
 }
-static void cp_a_h()
+static uint8_t cp_a_h()
 { // 0xBC
     reg_cp_8(R->A, R->H);
+    return M2S_RATIO;
 }
-static void cp_a_l()
+static uint8_t cp_a_l()
 { // 0xBD
     reg_cp_8(R->A, R->L);
+    return M2S_RATIO;
 }
-static void cp_a_hl()
+static uint8_t cp_a_hl()
 { // 0xBE
     reg_cp_8(R->A, *read_memory(getDR(HL_REG)));
+    return 2 * M2S_RATIO;
 }
-static void cp_a_a()
+static uint8_t cp_a_a()
 { // 0xBF
     reg_cp_8(R->A, R->A);
+    return M2S_RATIO;
 }
-static void cp_a_n()
+static uint8_t cp_a_n()
 { // 0xFE
     reg_cp_8(R->A, fetch());
+    return 2 * M2S_RATIO;
 }
 
-static void ld_pc_stack()
+static uint8_t ld_pc_stack()
 { // loads next two bytes from stack to PC.
-    uint8_t upper = pop_stack();
     uint8_t lower = pop_stack();
+    uint8_t upper = pop_stack();
     uint16_t result = (upper << BYTE) | lower;
-    set_stack_pointer(result);
-    pulse_clock(); 
+    R->PC = result;
 }
 // Implemented Instruction. (- - - -)
-static void ret_nz()
+static uint8_t ret_nz()
 { // 0xC0
-    if (!is_flag_set(ZERO_FLAG)) ld_pc_stack();
-    pulse_clock();
+    bool can_load = !is_flag_set(ZERO_FLAG);
+    if (can_load)
+    {
+        ld_pc_stack();
+        return 5 * M2S_RATIO;
+    }
+    return 2 * M2S_RATIO;
 }
-static void ret_nc()
+static uint8_t ret_nc()
 { // 0xD0
-    if (!is_flag_set(CARRY_FLAG)) ld_pc_stack();
-    pulse_clock();
+    bool can_load = !is_flag_set(ZERO_FLAG);
+    if (can_load)
+    {
+        ld_pc_stack();
+        return 5 * M2S_RATIO;
+    }
+    return 2 * M2S_RATIO;
 }
-static void ret_c()
+static uint8_t ret_c()
 { // 0xD8
-    if (is_flag_set(CARRY_FLAG)) ld_pc_stack();
-    pulse_clock();
+    bool can_load = is_flag_set(CARRY_FLAG);
+    if (can_load)
+    {
+        ld_pc_stack();
+        return 5 * M2S_RATIO;
+    }
+    return 2 * M2S_RATIO;
 }
-static void ret_z()
+static uint8_t ret_z()
 { // 0xC8
-    if (is_flag_set(ZERO_FLAG)) ld_pc_stack();
-    pulse_clock();
+    bool can_load = is_flag_set(ZERO_FLAG);
+    if (can_load)
+    {
+        ld_pc_stack();
+        return 5 * M2S_RATIO;
+    }
+    return 2 * M2S_RATIO;
 }
-static void ret()
+static uint8_t ret()
 { // 0xC9
     ld_pc_stack();
+    return 4 * M2S_RATIO;
 }
-static void reti()
+static uint8_t reti()
 { // 0xD9
-    cpu->interrupt_enabled = true;
     ld_pc_stack();
+    cpu->ime_scheduled = true;
+    return 4 * M2S_RATIO;
 }
 
-static void ld_stack_pc()
+static uint8_t ld_stack_pc()
 { // Loads PC onto stack. 0xC7-0xF7 & 0xF7-0xFF
     uint8_t upper = (R->PC >> BYTE) & LOWER_BYTE_MASK;
     uint8_t lower = R->PC & LOWER_BYTE_MASK;
-    push_stack(lower);
     push_stack(upper);
-    pulse_clock();
+    push_stack(lower);
 }
 // Implemented functions. (- - - -)
-static void rst_00()
+static uint8_t rst_00()
 { // 0xC7
     ld_stack_pc();
-    R->PC = 0x00;
+    R->PC = 0x0000;
+    return 4 * M2S_RATIO;
 }
-static void rst_10()
+static uint8_t rst_10()
 { // D7
     ld_stack_pc();
-    R->PC = 0x10;
+    R->PC = 0x0010;
+    return 4 * M2S_RATIO;
 }
-static void rst_20()
+static uint8_t rst_20()
 {
     ld_stack_pc();
-    R->PC = 0x20;
+    R->PC = 0x0020;
+    return 4 * M2S_RATIO;
 }
-static void rst_30()
+static uint8_t rst_30()
 {
     ld_stack_pc();
-    R->PC = 0x30;
+    R->PC = 0x0030;
+    return 4 * M2S_RATIO;
 }
-static void rst_08()
+static uint8_t rst_08()
 { // 0xCF
     ld_stack_pc();
-    R->PC = 0x08;
+    R->PC = 0x0008;
+    return 4 * M2S_RATIO;
 }
-static void rst_18()
+static uint8_t rst_18()
 { // 0xDF
     ld_stack_pc();
-    R->PC = 0x18;
+    R->PC = 0x0018;
+    return 4 * M2S_RATIO;
 }
-static void rst_28()
+static uint8_t rst_28()
 { // 0xEF
     ld_stack_pc();
-    R->PC = 0x28;
+    R->PC = 0x0028;
+    return 4 * M2S_RATIO;
 }
-static void rst_38()
+static uint8_t rst_38()
 { // 0xFF
     ld_stack_pc();
-    R->PC = 0x38;
+    R->PC = 0x0038;
+    return 4 * M2S_RATIO;
 }
-static void call_nz_nn()
+static uint8_t call_nz_nn()
 { // 0xC4
-    uint8_t upper = fetch();
     uint8_t lower = fetch();
+    uint8_t upper = fetch();
     if(!is_flag_set(ZERO_FLAG))
     {
         ld_stack_pc();
         uint16_t result = (upper << BYTE) | lower;
         R->PC = result;
+        return 6 * M2S_RATIO;
     }
+    return 3 * M2S_RATIO;
 }
-static void call_nc_nn()
+static uint8_t call_nc_nn()
 { // 0xC=D4
-    uint8_t upper = fetch();
     uint8_t lower = fetch();
+    uint8_t upper = fetch();
     if(!is_flag_set(CARRY_FLAG))
     {
         ld_stack_pc();
         uint16_t result = (upper << BYTE) | lower;
         R->PC = result;
+        return 6 * M2S_RATIO;
     }
+    return 3 * M2S_RATIO;
 }
-static void call_z_nn()
+static uint8_t call_z_nn()
 { // 0xCC
-    uint8_t upper = fetch();
     uint8_t lower = fetch();
+    uint8_t upper = fetch();
     if(is_flag_set(ZERO_FLAG))
     {
         ld_stack_pc();
         uint16_t result = (upper << BYTE) | lower;
         R->PC = result;
+        return 6 * M2S_RATIO;
     }
+    return 3 * M2S_RATIO;
 }
-static void call_c_nn()
+static uint8_t call_c_nn()
 { // 0xDC
-    uint8_t upper = fetch();
     uint8_t lower = fetch();
+    uint8_t upper = fetch();
     if(is_flag_set(CARRY_FLAG))
     {
         ld_stack_pc();
         uint16_t result = (upper << BYTE) | lower;
         R->PC = result;
+        return 6 * M2S_RATIO;
     }
+    return 3 * M2S_RATIO;
 }
-static void call_nn()
+static uint8_t call_nn()
 { // 0xCD
-    uint8_t upper = fetch();
     uint8_t lower = fetch();
+    uint8_t upper = fetch();
     ld_stack_pc();
     uint16_t result = (upper << BYTE) | lower;
     R->PC = result;
+    return 6 * M2S_RATIO;
 }
 
-static void jr_n()
+static uint8_t jr_n()
 { // 0x18 (- - - -)
     int8_t offset = (int8_t) fetch();
     R->PC += offset;
-    pulse_clock();
+    return 3 * M2S_RATIO;
 }
-static void jr_z_n()
+static uint8_t jr_z_n()
 { // 0x28 | (- - - -)
-    if(is_flag_set(ZERO_FLAG))
+    int8_t offset = (int8_t) fetch();
+    if(is_flag_set(ZERO_FLAG)) 
     {
-        int8_t offset = (int8_t) fetch();
         R->PC += offset;
+        return 3 * M2S_RATIO;
     }
-    pulse_clock(); 
+    return 2 * M2S_RATIO;
 }
-static void jr_c_n()
+static uint8_t jr_c_n()
 { // 0x38 (- - - -)
-    if(is_flag_set(CARRY_FLAG))
+    int8_t offset = (int8_t) fetch();
+    if(is_flag_set(CARRY_FLAG)) 
     {
-        int8_t offset = (int8_t) fetch();
         R->PC += offset;
+        return 3 * M2S_RATIO;
     }
-    pulse_clock();
+    return 2 * M2S_RATIO;
 }
-static void jr_nz_n()
+static uint8_t jr_nz_n()
 { // 0x20 (- - - -)
-    if(!is_flag_set(ZERO_FLAG))
+    int8_t offset = (int8_t) fetch();
+    if(!is_flag_set(ZERO_FLAG)) 
     {
-        int8_t offset = (int8_t) fetch();
         R->PC += offset;
+        return 3 * M2S_RATIO;
     }
-    pulse_clock();
+    return 2 * M2S_RATIO;
 }
-static void jr_nc_n()
+static uint8_t jr_nc_n()
 { // 0x30
-    if(!is_flag_set(CARRY_FLAG))
+    int8_t offset = (int8_t) fetch();
+    if(!is_flag_set(CARRY_FLAG)) 
     {
-        int8_t offset = (int8_t) fetch();
         R->PC += offset;
+        return 3 * M2S_RATIO;
     }
-    pulse_clock();
+    return 2 * M2S_RATIO;
 }
-static void jp_nz_nn()
+static uint8_t jp_nz_nn()
 { // 0xC2
-    uint8_t upper = fetch();
     uint8_t lower = fetch();
+    uint8_t upper = fetch();
     if(!is_flag_set(ZERO_FLAG))
     {
         uint16_t result = (upper << BYTE) | lower;
         R->PC = result;
-        pulse_clock();
+        return 4 * M2S_RATIO;
     }
+    return 3 * M2S_RATIO;
 }
-static void jp_nc_nn()
+static uint8_t jp_nc_nn()
 { // 0xD2
-    uint8_t upper = fetch();
     uint8_t lower = fetch();
+    uint8_t upper = fetch();
     if(!is_flag_set(CARRY_FLAG))
     {
         uint16_t result = (upper << BYTE) | lower;
         R->PC = result;
-        pulse_clock();
+        return 4 * M2S_RATIO;
     }
+    return 3 * M2S_RATIO;
 }
-static void jp_nn()
+static uint8_t jp_nn()
 { // C3
-    uint8_t upper = fetch();
     uint8_t lower = fetch();
+    uint8_t upper = fetch();
     uint16_t result = (upper << BYTE) | lower;
     R->PC = result;
-    pulse_clock();
+    return 4 * M2S_RATIO;
 }
-static void jp_z_nn()
+static uint8_t jp_z_nn()
 { // 0xCA
-    uint8_t upper = fetch();
     uint8_t lower = fetch();
+    uint8_t upper = fetch();
     if(is_flag_set(ZERO_FLAG))
     {
         uint16_t result = (upper << BYTE) | lower;
         R->PC = result;
-        pulse_clock();
+        return 4 * M2S_RATIO;
     }
+    return 3 * M2S_RATIO;
 }
-static void jp_c_nn()
+static uint8_t jp_c_nn()
 {
-    uint8_t upper = fetch();
     uint8_t lower = fetch();
+    uint8_t upper = fetch();
     if(is_flag_set(CARRY_FLAG))
     {
         uint16_t result = (upper << BYTE) | lower;
         R->PC = result;
-        pulse_clock();
+        return 4 * M2S_RATIO;
     }
+    return 3 * M2S_RATIO;
 }
-static void jp_hl()
+static uint8_t jp_hl()
 { // 0xE9
     R->PC = getDR(HL_REG);
+    return M2S_RATIO;
 }
 
-static void daa()
+static uint8_t daa()
 { //0x27 (Z - 0 C)
-  // Changes a to corrected decimal value.
+    // Changes a to corrected decimal value.
+    uint8_t correction = 0;
+  
+    // Check for adjustment conditions
+    if (is_flag_set(HALF_CARRY_FLAG) || ((R->A & 0x0F) > 9)) {
+        correction |= 0x06;  // Half Carry Fix
+    }
+    if (is_flag_set(CARRY_FLAG) || (R->A > 0x99)) {
+        correction |= 0x60;  // Carry Fix
+        set_flag(true, CARRY_FLAG);  // Set Carry Flag
+    }
+    else
+    {
+        set_flag(false, CARRY_FLAG);
+    }
+
+    // Apply correction
+    if (!(is_flag_set(SUBTRACT_FLAG))) {  // If last op was addition
+        R->A += correction;
+    } else {  // If last op was subtraction
+        R->A -= correction;
+    }
+    bool is_zero = !((bool) R->A);
+    set_flag(is_zero, ZERO_FLAG);
+    set_flag(false, HALF_CARRY_FLAG);
+    return M2S_RATIO;
 }
-static void cpl()
+static uint8_t cpl()
 { // 0x2F (- 1 1 -)
     R->A = ~R->A;
     set_flag(true, SUBTRACT_FLAG);
     set_flag(true, HALF_CARRY_FLAG);
+    return M2S_RATIO;
 }
-static void scf()
+static uint8_t scf()
 { // 0x07 (- 0 0 1)
     set_flag(false, SUBTRACT_FLAG);
     set_flag(false, HALF_CARRY_FLAG);
     set_flag(true, CARRY_FLAG);
+    return M2S_RATIO;
 }
-static void ccf()
+static uint8_t ccf()
 { // 0x3F (- 0 0 C)
     set_flag(false, SUBTRACT_FLAG);
     set_flag(false, HALF_CARRY_FLAG);
     set_flag(!is_flag_set(CARRY_FLAG), CARRY_FLAG);
+    return M2S_RATIO;
 }
 
-static void reg_ldh_8(uint8_t dest, uint8_t value)
-{
-    write_memory(IO_REGISTERS_START + dest, value);
-}
-// Implemented Functions. (- - - -)
-static void ldh_n_a()
+static uint8_t ldh_n_a()
 { // 0xE0
-    reg_ldh_8(*read_memory(fetch()), R->A);
+    write_memory(IO_REGISTERS_START + fetch(), R->A);
+    return 3 * M2S_RATIO;
 }
-static void ldh_a_n()
+static uint8_t ldh_a_n()
 { // 0xF0
-    reg_ldh_8(R->A, *read_memory(fetch()));
+    R->A = *read_memory(IO_REGISTERS_START + fetch());
+    return 3 * M2S_RATIO;
 }
-static void ldh_c_a()
+static uint8_t ldh_c_a()
 { // 0xE1
-    reg_ldh_8(*read_memory(R->C), R->A);
+    *read_memory(IO_REGISTERS_START + R->C) = R->A;
+    return 2 * M2S_RATIO;
 }
-static void ldh_a_c()
+static uint8_t ldh_a_c()
 { // 0xF1
-    reg_ldh_8(R->A, *read_memory(R->C));
+    R->A = *read_memory(IO_REGISTERS_START + R->C);
+    return 2 * M2S_RATIO;
 }
 
-static void ld_nn_a()
+static uint8_t ld_nn_a()
 { // 0xEA
-    uint8_t upper = fetch();
     uint8_t lower = fetch();
+    uint8_t upper = fetch();
     uint16_t address = (upper << BYTE) | lower;
     write_memory(address, R->A);
+    return 4 * M2S_RATIO;
 }
-static void ld_a_nn()
+static uint8_t ld_a_nn()
 { // 0xFA
-    uint8_t upper = fetch();
     uint8_t lower = fetch();
+    uint8_t upper = fetch();
     uint16_t address = (upper << BYTE) | lower;
-    R->A = *read_memory(address); 
+    R->A = *read_memory(address);
+    return 4 * M2S_RATIO;
 }
-static void ld_hl_sp_n()
+static uint8_t ld_hl_sp_n()
 { // 0xF8 (0 0 H C)
     int8_t n = (int8_t) fetch();
     uint16_t result = R->SP + n;
-    bool hc_exists = ((R->SP & LOWER_BYTE_MASK) + n) > LOWER_BYTE_MASK;
-    bool c_exits = (R->SP + n) > MAX_INT_16;
+    bool hc_exists = ((R->SP & LOWER_4_MASK) + n) > LOWER_4_MASK;
+    bool c_exits = ((R->SP & LOWER_BYTE_MASK) + n) > MAX_INT_8;
     set_flag(false, ZERO_FLAG);
     set_flag(false, SUBTRACT_FLAG);
     set_flag(hc_exists, HALF_CARRY_FLAG);
     set_flag(c_exits, CARRY_FLAG);
     setDR(HL_REG, result);
-    pulse_clock(); 
+    return 3 * M2S_RATIO;
 }
-static void ld_sp_hl()
+static uint8_t ld_sp_hl()
 {
-    set_stack_pointer(getDR(HL_REG));
+    R->SP = getDR(HL_REG);
+    return 2 * M2S_RATIO;
 }
-static void add_sp_n()
+static uint8_t add_sp_n()
 { // 0xE7 (0 0 H C)
     int8_t n = (int8_t) fetch();
     uint16_t sum = (uint16_t) (R->SP + n);
-    bool hc_exists = ((R->SP & LOWER_BYTE_MASK) + n) > LOWER_BYTE_MASK;
-    bool c_exists  = (R->SP + n) > MAX_INT_16;
+    bool hc_exists = ((R->SP & LOWER_4_MASK) + n) > LOWER_4_MASK;
+    bool c_exists  = ((R->SP & LOWER_BYTE_MASK) + n) > MAX_INT_8;
     set_flag(false, ZERO_FLAG);
     set_flag(false, SUBTRACT_FLAG);
     set_flag(hc_exists, HALF_CARRY_FLAG);
     set_flag(c_exists, CARRY_FLAG);
+    R->SP = sum;
+    return 4 * M2S_RATIO;
 }
 
-static void di()
+static uint8_t di()
 { // 0xF3
-    cpu->interrupt_enabled = false;
+    cpu->ime = false;
+    return M2S_RATIO;
 }
-static void ei()
+static uint8_t ei()
 { // 0xFB Enables after next instruction.
-    cpu->interrupt_enabled = IE_NEXT_INS;
+    cpu->ime_scheduled = true;
+    return M2S_RATIO;
 }
 
-static void print_registers()
-{ // 0x43
-    printf("\n-CPU REGISTERS-\n");
-    printf("A -> %02X | ", R->A);
-    printf("%02X <- F\n", R->F);
-    printf("B -> %02X | ", R->B); 
-    printf("%02X <- C\n", R->C);
-    printf("D -> %02X | ", R->D); 
-    printf("%02X <- E\n", R->E);
-    printf("H -> %02X | ", R->H); 
-    printf("%02X <- L\n", R->L);
-    printf("PC -> %02X\n", R->PC);
-    printf("SP -> %02X\n\n         -FLAGS-\n", R->SP);
-    printf("(Z - %d)" , (ZERO_FLAG & R->F == ZERO_FLAG));
-    printf(" (N - %d)", (SUBTRACT_FLAG & R->F) == SUBTRACT_FLAG);
-    printf(" (H - %d)", (HALF_CARRY_FLAG & R->F) == HALF_CARRY_FLAG);
-    printf(" (C - %d)\n\n", (CARRY_FLAG & R->F) == CARRY_FLAG);
+static uint8_t vram_print()
+{
+    uint8_t lower  = fetch();
+    uint8_t upper  = fetch();
+    uint16_t start = (upper << BYTE) | lower;
+    lower          = fetch();
+    upper          = fetch();
+    uint16_t end   = (upper << BYTE) | lower;
+    bool bank      = (bool) fetch();
+    print_vram(start, end, bank);
+    return M2S_RATIO; 
 }
 
-typedef void (*OpcodeHandler)();
+typedef uint8_t (*OpcodeHandler)();
 OpcodeHandler opcode_table[256] = 
 {
     /*              ROW 1               */
-    /* 0x00 */ [NOP]       = no_op,   
+    /* 0x00 */ [NOP]       = nop,   
     /* 0x01 */ [LD_BC_NN]  = ld_bc_nn,
     /* 0x02 */ [LD_BC_A]   = ld_bc_a,
     /* 0x03 */ [INC_BC]    = inc_bc,
@@ -1642,7 +1922,7 @@ OpcodeHandler opcode_table[256] =
     /* 0x3E */ [LD_A_N]    = ld_a_n,
     /* 0x3F */ [CCF]       = ccf,
     /*              ROW 5                */
-    /* 0x40 */ [LD_B_B]    = no_op,   
+    /* 0x40 */ [LD_B_B]    = nop,   
     /* 0x41 */ [LD_B_C]    = ld_b_c,
     /* 0x42 */ [LD_B_D]    = ld_b_d,
     /* 0x43 */ [LD_B_E]    = ld_b_e,
@@ -1651,17 +1931,17 @@ OpcodeHandler opcode_table[256] =
     /* 0x46 */ [LD_B_HL]   = ld_b_hl,
     /* 0x47 */ [LD_B_A]    = ld_b_a,
     /* 0x48 */ [LD_C_B]    = ld_c_b,
-    /* 0x49 */ [LD_C_C]    = no_op,
+    /* 0x49 */ [LD_C_C]    = nop,
     /* 0x4A */ [LD_C_D]    = ld_c_d,
     /* 0x4B */ [LD_C_E]    = ld_c_e,
     /* 0x4C */ [LD_C_H]    = ld_c_h,
     /* 0x4D */ [LD_C_L]    = ld_c_l,
-    /* 0x4E */ [LD_L_HL]   = ld_l_hl,
+    /* 0x4E */ [LD_C_HL]   = ld_c_hl,
     /* 0x4F */ [LD_C_A]    = ld_c_a,
     /*              ROW 6                */
     /* 0x50 */ [LD_D_B]    = ld_d_b,   
     /* 0x51 */ [LD_D_C]    = ld_d_c,
-    /* 0x52 */ [LD_D_D]    = no_op,
+    /* 0x52 */ [LD_D_D]    = nop,
     /* 0x53 */ [LD_D_E]    = ld_d_e,
     /* 0x54 */ [LD_D_H]    = ld_d_h,
     /* 0x55 */ [LD_D_L]    = ld_d_l,
@@ -1670,7 +1950,7 @@ OpcodeHandler opcode_table[256] =
     /* 0x58 */ [LD_E_B]    = ld_e_b,
     /* 0x59 */ [LD_E_C]    = ld_e_c,
     /* 0x5A */ [LD_E_D]    = ld_e_d,
-    /* 0x5B */ [LD_E_E]    = no_op,
+    /* 0x5B */ [LD_E_E]    = nop,
     /* 0x5C */ [LD_E_H]    = ld_e_h,
     /* 0x5D */ [LD_E_L]    = ld_e_l,
     /* 0x5E */ [LD_E_HL]   = ld_e_hl,
@@ -1680,16 +1960,16 @@ OpcodeHandler opcode_table[256] =
     /* 0x61 */ [LD_H_C]    = ld_h_c,
     /* 0x62 */ [LD_H_D]    = ld_h_d,
     /* 0x63 */ [LD_H_E]    = ld_h_e,
-    /* 0x64 */ [LD_H_H]    = no_op,
+    /* 0x64 */ [LD_H_H]    = nop,
     /* 0x65 */ [LD_H_L]    = ld_h_l,
     /* 0x66 */ [LD_H_HL]   = ld_h_hl,
     /* 0x67 */ [LD_H_A]    = ld_h_a,
-    /* 0x68 */ [LD_H_B]    = ld_h_b,
+    /* 0x68 */ [LD_L_B]    = ld_l_b,
     /* 0x69 */ [LD_L_C]    = ld_l_c,
     /* 0x6A */ [LD_L_D]    = ld_l_d,
     /* 0x6B */ [LD_L_E]    = ld_l_e,
     /* 0x6C */ [LD_L_H]    = ld_l_h,
-    /* 0x6D */ [LD_L_L]    = no_op,
+    /* 0x6D */ [LD_L_L]    = nop,
     /* 0x6E */ [LD_L_HL]   = ld_l_hl,
     /* 0x6F */ [LD_L_A]    = ld_l_a,
     /*              ROW 8                */
@@ -1708,7 +1988,7 @@ OpcodeHandler opcode_table[256] =
     /* 0x7C */ [LD_A_H]    = ld_a_h,
     /* 0x7D */ [LD_A_L]    = ld_a_l,
     /* 0x7E */ [LD_A_HL]   = ld_a_hl,
-    /* 0x7F */ [LD_A_A]    = no_op,
+    /* 0x7F */ [LD_A_A]    = nop,
     /*              ROW 9                */
     /* 0x80 */ [ADD_A_B]   = add_a_b,   
     /* 0x81 */ [ADD_A_C]   = add_a_c,
@@ -1717,7 +1997,7 @@ OpcodeHandler opcode_table[256] =
     /* 0x84 */ [ADD_A_H]   = add_a_h,
     /* 0x85 */ [ADD_A_L]   = add_a_l,
     /* 0x86 */ [ADD_A_HL]  = add_a_hl,
-    /* 0x87 */ [ADD_A_A]   = adc_a_a,
+    /* 0x87 */ [ADD_A_A]   = add_a_a,
     /* 0x88 */ [ADC_A_B]   = adc_a_b,
     /* 0x89 */ [ADC_A_C]   = adc_a_c,
     /* 0x8A */ [ADC_A_D]   = adc_a_d,
@@ -1789,7 +2069,7 @@ OpcodeHandler opcode_table[256] =
     /* 0xC8 */ [RET_Z]     = ret_z,
     /* 0xC9 */ [RET]       = ret,
     /* 0xCA */ [JP_Z_NN]   = jp_z_nn,
-    /* 0xCB */ [CB_PREFIX] = no_op,
+    /* 0xCB */ [CB_PREFIX] = nop,
     /* 0xCC */ [CALL_Z_NN] = call_z_nn,
     /* 0xCD */ [CALL_NN]   = call_nn,
     /* 0xCE */ [ADC_A_N]   = adc_a_n,
@@ -1798,7 +2078,7 @@ OpcodeHandler opcode_table[256] =
     /* 0xD0 */ [RET_NC]    = ret_nc,   
     /* 0xD1 */ [POP_DE]    = pop_de,
     /* 0xD2 */ [JP_NC_NN]  = jp_nc_nn,
-    /* 0xD3 */ [REG_PRINT] = print_registers,
+    /* 0xD3 */ [0xD3]      = vram_print,
     /* 0xD4 */ [CALL_NC_NN]= call_nc_nn,
     /* 0xD5 */ [PUSH_DE]   = push_de,
     /* 0xD6 */ [SUB_A_N]   = sub_a_n,
@@ -1806,34 +2086,34 @@ OpcodeHandler opcode_table[256] =
     /* 0xD8 */ [RET_C]     = ret_c,
     /* 0xD9 */ [RETI]      = reti,
     /* 0xDA */ [JP_C_NN]   = jp_c_nn,
-    /* 0xDB */ [0xDB]      = no_op,
+    /* 0xDB */ [0xDB]      = nop,
     /* 0xDC */ [CALL_C_NN] = call_c_nn,
-    /* 0xDD */ [0xDD]      = no_op,
+    /* 0xDD */ [0xDD]      = nop,
     /* 0xDE */ [SBC_A_N]   = sbc_a_n,
     /* 0xDF */ [RST_18H]   = rst_18,
     /*              ROW 15                */
-    /* 0xE0 */ [LDH_A_N]   = ldh_a_n,   
+    /* 0xE0 */ [LDH_N_A]   = ldh_n_a,   
     /* 0xE1 */ [POP_HL]    = pop_hl,
     /* 0xE2 */ [LDH_C_A]   = ldh_c_a,
-    /* 0xE3 */ [0xE3]      = no_op,
-    /* 0xE4 */ [0xE4]      = no_op,
+    /* 0xE3 */ [0xE3]      = nop,
+    /* 0xE4 */ [0xE4]      = nop,
     /* 0xE5 */ [PUSH_HL]   = push_hl,
     /* 0xE6 */ [AND_A_N]   = and_a_n,
     /* 0xE7 */ [RST_20H]   = rst_20,
     /* 0xE8 */ [ADD_SP_N]  = add_sp_n,
     /* 0xE9 */ [JP_HL]     = jp_hl,
     /* 0xEA */ [LD_NN_A]   = ld_nn_a,
-    /* 0xEB */ [0xEB]      = no_op,
-    /* 0xEC */ [0xEC]      = no_op,
-    /* 0xED */ [0xED]      = no_op,
+    /* 0xEB */ [0xEB]      = nop,
+    /* 0xEC */ [0xEC]      = nop,
+    /* 0xED */ [0xED]      = nop,
     /* 0xEE */ [XOR_A_N]   = xor_a_n,
     /* 0xEF */ [RST_28H]   = rst_28,
     /*              ROW 16                */
     /* 0xF0 */ [LDH_A_N]   = ldh_a_n,   
     /* 0xF1 */ [POP_AF]    = pop_af,
-    /* 0xF2 */ [LD_A_C]    = ld_a_c,
+    /* 0xF2 */ [LDH_A_C]   = ldh_a_c,
     /* 0xF3 */ [DI]        = di,
-    /* 0xF4 */ [0xF4]      = no_op,
+    /* 0xF4 */ [0xF4]      = nop,
     /* 0xF5 */ [PUSH_AF]   = push_af,
     /* 0xF6 */ [OR_A_N]    = or_a_n,
     /* 0xF7 */ [RST_30H]   = rst_30,
@@ -1841,56 +2121,65 @@ OpcodeHandler opcode_table[256] =
     /* 0xF9 */ [LD_SP_HL]  = ld_sp_hl,
     /* 0xFA */ [LD_A_NN]   = ld_a_nn,
     /* 0xFB */ [EI]        = ei,
-    /* 0xFC */ [0xFC]      = no_op,
-    /* 0xFD */ [0xFD]      = no_op,
+    /* 0xFC */ [0xFC]      = nop,
+    /* 0xFD */ [0xFD]      = nop,
     /* 0xFE */ [CP_A_N]    = cp_a_n,
     /* 0xFF */ [RST_38H]   = rst_38,
     /*           END OPCODES               */
 };
 
-/* ADD 1 TO IMPLICIT CYLES DUE TO PREFIX */
+/* ADD 1 TO IMPLICIT CYLES DUE TO PREFIX FETCH */
+
 
 static void reg_rlc_8(uint8_t *r)
 { // 0x00 - 0x07
     bool c_exists = (bool) (*r & BIT_7_MASK);
-    *r = (*r < 1) + c_exists;
+
+    *r = (*r << 1) + c_exists;
     bool is_zero = !((bool) *r);
     set_flag(is_zero, ZERO_FLAG);
     set_flag(c_exists, CARRY_FLAG);
 }
 // Implemented Function. (Z 0 0 C)
-static void rlc_b()
+static uint8_t rlc_b()
 { //0x00
     reg_rlc_8(&(R->B));
+    return 2 * M2S_RATIO;
 }
-static void rlc_c()
+static uint8_t rlc_c()
 { //0x01
     reg_rlc_8(&(R->C));
+    return 2 * M2S_RATIO;
 }  
-static void rlc_d()
+static uint8_t rlc_d()
 { //0x02
     reg_rlc_8(&(R->D));
+    return 2 * M2S_RATIO;
 }  
-static void rlc_e()
+static uint8_t rlc_e()
 { //0x03
     reg_rlc_8(&(R->E));
+    return 2 * M2S_RATIO;
 }  
-static void rlc_h()
+static uint8_t rlc_h()
 { //0x04
     reg_rlc_8(&(R->H));
+    return 2 * M2S_RATIO;
 }  
-static void rlc_l()
+static uint8_t rlc_l()
 { //0x05
     reg_rlc_8(&(R->L));
+    return 2 * M2S_RATIO;
 }  
-static void rlc_hl()
+static uint8_t rlc_hl()
 { //0x06
     reg_rlc_8(read_memory(getDR(HL_REG)));
-    pulse_clock();
+    return 4 * M2S_RATIO;
 }  
-static void rlc_a()
+static uint8_t rlc_a()
 { //0x07
     reg_rlc_8(&(R->A));
+    return 2 * M2S_RATIO;
 }     
 
 static void reg_rrc_8(uint8_t *r)
@@ -1902,82 +2191,95 @@ static void reg_rrc_8(uint8_t *r)
     set_flag(c_exists, CARRY_FLAG);
 }
 // Implemented Function.  (Z 0 0 C)
-static void rrc_b()
+static uint8_t rrc_b()
 { // 0x08
     reg_rrc_8(&(R->B));
+    return 2 * M2S_RATIO;
 }
-static void rrc_c()
+static uint8_t rrc_c()
 { // 0x09
     reg_rrc_8(&(R->C));
+    return 2 * M2S_RATIO;
 }
-static void rrc_d()
+static uint8_t rrc_d()
 { // 0x0A
     reg_rrc_8(&(R->D));
+    return 2 * M2S_RATIO;
 }
-static void rrc_e()
+static uint8_t rrc_e()
 { // 0x0B
     reg_rrc_8(&(R->E));
+    return 2 * M2S_RATIO;
 }
-static void rrc_h()
+static uint8_t rrc_h()
 { // 0x0C
     reg_rrc_8(&(R->H));
+    return 2 * M2S_RATIO;
 }
-static void rrc_l()
+static uint8_t rrc_l()
 { // 0x0D
     reg_rrc_8(&(R->L));
+    return 2 * M2S_RATIO;
 }
-static void rrc_hl()
+static uint8_t rrc_hl()
 { // 0x0E
     reg_rrc_8(read_memory(getDR(HL_REG)));
-    pulse_clock();
-    pulse_clock();
+    return 4 * M2S_RATIO;
 }
-static void rrc_a()
+static uint8_t rrc_a()
 { // 0x0F
     reg_rrc_8(&(R->A));
+    return 2 * M2S_RATIO;
 }
 
 static void reg_rl_8(uint8_t *r)
 {
     bool c_exists = (bool) (*r & BIT_7_MASK);
-    *r = (*r < 1) + is_flag_set(CARRY_FLAG);
+    *r = (*r << 1) + is_flag_set(CARRY_FLAG);
     bool is_zero = !((bool) *r);
     set_flag(is_zero, ZERO_FLAG);
     set_flag(c_exists, CARRY_FLAG);
 }
 // Implemented Functions. (Z 0 0 C)
-static void rl_b()
+static uint8_t rl_b()
 { // 0x10
     reg_rl_8(&(R->B));
+    return 2 * M2S_RATIO;
 }
-static void rl_c()
+static uint8_t rl_c()
 { // 0x11
     reg_rl_8(&(R->C));
+    return 2 * M2S_RATIO;
 }
-static void rl_d()
+static uint8_t rl_d()
 { // 0x12
     reg_rl_8(&(R->D));
+    return 2 * M2S_RATIO;
 }
-static void rl_e()
+static uint8_t rl_e()
 { // 0x13
     reg_rl_8(&(R->E));
+    return 2 * M2S_RATIO;
 }
-static void rl_h()
+static uint8_t rl_h()
 { // 0x14
     reg_rl_8(&(R->H));
+    return 2 * M2S_RATIO;
 }
-static void rl_l()
+static uint8_t rl_l()
 { // 0x15
     reg_rl_8(&(R->L));
+    return 2 * M2S_RATIO;
 }
-static void rl_hl()
+static uint8_t rl_hl()
 { // 0x16
     reg_rl_8(read_memory(getDR(HL_REG)));
-    pulse_clock();
+    return 4 * M2S_RATIO;
 }
-static void rl_a()
+static uint8_t rl_a()
 { // 0x17
     reg_rl_8(&(R->A));
+    return 2 * M2S_RATIO;
 }
 
 static void reg_rr_8(uint8_t *r)
@@ -1989,122 +2291,161 @@ static void reg_rr_8(uint8_t *r)
     set_flag(c_exists, CARRY_FLAG);
 }
 // Implemented Functions. (Z 0 0 C)
-static void rr_b()
+static uint8_t rr_b()
 { // 0x18
     reg_rr_8(&(R->B));
+    return 2 * M2S_RATIO;
 }
-static void rr_c()
+static uint8_t rr_c()
 { // 0x19
     reg_rr_8(&(R->C));
+    return 2 * M2S_RATIO;
 }
-static void rr_d()
+static uint8_t rr_d()
 { // 0x1A
     reg_rr_8(&(R->D));
+    return 2 * M2S_RATIO;
 }
-static void rr_e()
+static uint8_t rr_e()
 { // 0x1B
     reg_rr_8(&(R->E));
+    return 2 * M2S_RATIO;
 }
-static void rr_h()
+static uint8_t rr_h()
 { // 0x1C
     reg_rr_8(&(R->H));
+    return 2 * M2S_RATIO;
 }
-static void rr_l()
+static uint8_t rr_l()
 { // 0x1D
     reg_rr_8(&(R->L));
+    return 2 * M2S_RATIO;
 }
-static void rr_hl()
+static uint8_t rr_hl()
 { // 0x1E
     reg_rr_8(read_memory(getDR(HL_REG)));
-    pulse_clock();
+    return 4 * M2S_RATIO;
 }
-static void rr_a()
+static uint8_t rr_a()
 { // 0x1F
     reg_rr_8(&(R->A));
+    return 2 * M2S_RATIO;
 }
 
 static void reg_sla_8(uint8_t *r)
 {
-    bool c_exists = (*r & BIT_7_MASK) == BIT_7_MASK;
+    bool c_exists = ((*r & BIT_7_MASK) == BIT_7_MASK);
     *r = (*r << 1);
+    if (c_exists)
+    {
+        *r = *r | BIT_7_MASK;
+    }
+    else
+    {
+        *r = *r & ~BIT_7_MASK;
+    }
     bool is_zero = !((bool) *r);
     set_flag(is_zero, ZERO_FLAG);
     set_flag(c_exists, CARRY_FLAG);
 }
 // Implemented Functions. (Z 0 0 C)
-static void sla_b()
+static uint8_t sla_b()
 { // 0x20
     reg_sla_8(&(R->B));
+    return 2 * M2S_RATIO;
 }
-static void sla_c()
+static uint8_t sla_c()
 { // 0x21
     reg_sla_8(&(R->C));
+    return 2 * M2S_RATIO;
 }
-static void sla_d()
+static uint8_t sla_d()
 { // 0x22
     reg_sla_8(&(R->D));
+    return 2 * M2S_RATIO;
 }
-static void sla_e()
+static uint8_t sla_e()
 { // 0x23
     reg_sla_8(&(R->E));
+    return 2 * M2S_RATIO;
 }
-static void sla_h()
+static uint8_t sla_h()
 { // 0x24
     reg_sla_8(&(R->H));
+    return 2 * M2S_RATIO;
 }
-static void sla_l()
+static uint8_t sla_l()
 { // 0x25
     reg_sla_8(&(R->L));
+    return 2 * M2S_RATIO;
 }
-static void sla_hl()
+static uint8_t sla_hl()
 { // 0x26
     reg_sla_8(read_memory(getDR(HL_REG)));
+    return 4 * M2S_RATIO;
 }
-static void sla_a()
+static uint8_t sla_a()
 { // 0x27
     reg_sla_8(&(R->A));
+    return 2 * M2S_RATIO;
 }
 
 static void reg_sra_8(uint8_t *r)
 {
     bool c_exists = (*r & BIT_0_MASK) == BIT_0_MASK;
     *r = (*r >> 1);
+    if (c_exists)
+    {
+        *r = *r | BIT_0_MASK;
+    }
+    else
+    {
+        *r = *r & ~BIT_0_MASK;
+    }
     bool is_zero = !((bool) *r);
     set_flag(is_zero, ZERO_FLAG);
     set_flag(c_exists, CARRY_FLAG);
 }
 // Implemented Functions. (Z 0 0 C)
-static void sra_b()
+static uint8_t sra_b()
 { // 0x28
     reg_sra_8(&(R->B));
+    return 2 * M2S_RATIO;
 }
-static void sra_c()
+static uint8_t sra_c()
 { // 0x29
     reg_sra_8(&(R->C));
+    return 2 * M2S_RATIO;
 }
-static void sra_d()
+static uint8_t sra_d()
 { // 0x2A
     reg_sra_8(&(R->D));
+    return 2 * M2S_RATIO;
 }
-static void sra_e()
+static uint8_t sra_e()
 { // 0x2B
     reg_sra_8(&(R->E));
+    return 2 * M2S_RATIO;
 }
-static void sra_h()
+static uint8_t sra_h()
 { // 0x2C
     reg_sra_8(&(R->H));
+    return 2 * M2S_RATIO;
 }
-static void sra_l()
+static uint8_t sra_l()
 { // 0x2D
     reg_sra_8(&(R->L));
+    return 2 * M2S_RATIO;
 }
-static void sra_hl()
+static uint8_t sra_hl()
 { // 0x2E
     reg_sra_8(read_memory(getDR(HL_REG)));
+    return 4 * M2S_RATIO;
 }
-static void sra_a()
+static uint8_t sra_a()
 { // 0x2F
     reg_sra_8(&(R->A));
+    return 2 * M2S_RATIO;
 }
 
 static void reg_swap_8(uint8_t *r)
@@ -2114,37 +2455,45 @@ static void reg_swap_8(uint8_t *r)
     set_flag(is_zero, ZERO_FLAG);
 }
 // Implemented Functions. (Z 0 0 0)
-static void swap_b()
+static uint8_t swap_b()
 { // 0x30
     reg_swap_8(&(R->B));
+    return 2 * M2S_RATIO;
 }
-static void swap_c()
+static uint8_t swap_c()
 { // 0x31
-    reg_swap_8(&(R->C));   
+    reg_swap_8(&(R->C));
+    return 2 * M2S_RATIO;   
 }
-static void swap_d()
+static uint8_t swap_d()
 { // 0x32
     reg_swap_8(&(R->D));
+    return 2 * M2S_RATIO;
 }
-static void swap_e()
+static uint8_t swap_e()
 { // 0x33
     reg_swap_8(&(R->E));
+    return 2 * M2S_RATIO;
 }
-static void swap_h()
+static uint8_t swap_h()
 { // 0x34
     reg_swap_8(&(R->H));
+    return 2 * M2S_RATIO;
 }
-static void swap_l()
+static uint8_t swap_l()
 { // 0x35
     reg_swap_8(&(R->L));
+    return 2 * M2S_RATIO;
 }
-static void swap_hl()
+static uint8_t swap_hl()
 { // 0x36
     reg_swap_8(read_memory(getDR(HL_REG)));
+    return 4 * M2S_RATIO;
 }
-static void swap_a()
+static uint8_t swap_a()
 { // 0x37
     reg_swap_8(&(R->A));
+    return 2 * M2S_RATIO;
 }
 
 static void reg_srl_8(uint8_t *r)
@@ -2156,832 +2505,1032 @@ static void reg_srl_8(uint8_t *r)
     set_flag(c_exists, CARRY_FLAG);
 }
 // Implemented Functions. (Z 0 0 C)
-static void srl_b()
+static uint8_t srl_b()
 { // 0x38
     reg_srl_8(&(R->B));
+    return 2 * M2S_RATIO;
 }
-static void srl_c()
+static uint8_t srl_c()
 { // 0x39
     reg_srl_8(&(R->C));
+    return 2 * M2S_RATIO;
 }
-static void srl_d()
+static uint8_t srl_d()
 { // 0x3A
     reg_srl_8(&(R->D));
+    return 2 * M2S_RATIO;
 }
-static void srl_e()
+static uint8_t srl_e()
 { // 0x3B
     reg_srl_8(&(R->E));
+    return 2 * M2S_RATIO;
 }
-static void srl_h()
+static uint8_t srl_h()
 { // 0x3C
     reg_srl_8(&(R->H));
+    return 2 * M2S_RATIO;
 }
-static void srl_l()
+static uint8_t srl_l()
 { // 0x3D
     reg_srl_8(&(R->L));
+    return 2 * M2S_RATIO;
 }
-static void srl_hl()
+static uint8_t srl_hl()
 { // 0x3E
     reg_srl_8(read_memory(getDR(HL_REG)));
+    return 4 * M2S_RATIO;
 }
-static void srl_a()
+static uint8_t srl_a()
 { // 0x3F
     reg_srl_8(&(R->A));
+    return 2 * M2S_RATIO;
 }
 
 static void reg_bit_x(BitMask mask, uint8_t *r)
 {
-    bool is_zero = (*r & mask) == mask;
+    bool is_zero = !((*r & mask));
     set_flag(is_zero, ZERO_FLAG);
     set_flag(false, SUBTRACT_FLAG);
     set_flag(true, HALF_CARRY_FLAG);
 }
 // Implemented Functions. (Z 0 1 -)
-static void bit_0_b()
+static uint8_t bit_0_b()
 { // 0x40
     reg_bit_x(BIT_0_MASK, &(R->B));
+    return 2 * M2S_RATIO;
 }
-static void bit_0_c()
+static uint8_t bit_0_c()
 { // 0x41
     reg_bit_x(BIT_0_MASK, &(R->C));
+    return 2 * M2S_RATIO;
 }
-static void bit_0_d()
+static uint8_t bit_0_d()
 { // 0x42
     reg_bit_x(BIT_0_MASK, &(R->D));
+    return 2 * M2S_RATIO;
 }
-static void bit_0_e()
+static uint8_t bit_0_e()
 { // 0x43
     reg_bit_x(BIT_0_MASK, &(R->E));
+    return 2 * M2S_RATIO;
 }
-static void bit_0_h()
+static uint8_t bit_0_h()
 { // 0x44
     reg_bit_x(BIT_0_MASK, &(R->H));
+    return 2 * M2S_RATIO;
 }
-static void bit_0_l()
+static uint8_t bit_0_l()
 { // 0x45
     reg_bit_x(BIT_0_MASK, &(R->L));
+    return 2 * M2S_RATIO;
 }
-static void bit_0_hl()
+static uint8_t bit_0_hl()
 { // 0x46
     reg_bit_x(BIT_0_MASK, read_memory(getDR(HL_REG)));
+    return 3 * M2S_RATIO;
 }
-static void bit_0_a()
+static uint8_t bit_0_a()
 { // 0x47
     reg_bit_x(BIT_0_MASK, &(R->A));
+    return 2 * M2S_RATIO;
 }
-static void bit_1_b()
+static uint8_t bit_1_b()
 { // 0x48
     reg_bit_x(BIT_1_MASK, &(R->B));
+    return 2 * M2S_RATIO;
 }
-static void bit_1_c()
+static uint8_t bit_1_c()
 { // 0x49
     reg_bit_x(BIT_1_MASK, &(R->C));
+    return 2 * M2S_RATIO;
 }
-static void bit_1_d()
+static uint8_t bit_1_d()
 { // 0x4A
     reg_bit_x(BIT_1_MASK, &(R->D));
+    return 2 * M2S_RATIO;
 }
-static void bit_1_e()
+static uint8_t bit_1_e()
 { // 0x4B
     reg_bit_x(BIT_1_MASK, &(R->E));
+    return 2 * M2S_RATIO;
 }
-static void bit_1_h()
+static uint8_t bit_1_h()
 { // 0x4C
     reg_bit_x(BIT_1_MASK, &(R->H));
+    return 2 * M2S_RATIO;
 }
-static void bit_1_l()
+static uint8_t bit_1_l()
 { // 0x4D
     reg_bit_x(BIT_1_MASK, &(R->L));
+    return 2 * M2S_RATIO;
 }
-static void bit_1_hl()
+static uint8_t bit_1_hl()
 { // 0x4E
     reg_bit_x(BIT_1_MASK, read_memory(getDR(HL_REG)));
+    return 3 * M2S_RATIO;
 }
-static void bit_1_a()
+static uint8_t bit_1_a()
 { // 0x4F
     reg_bit_x(BIT_1_MASK, &(R->A));
+    return 2 * M2S_RATIO;
 }
-static void bit_2_b()
+static uint8_t bit_2_b()
 { // 0x50
     reg_bit_x(BIT_2_MASK, &(R->B));
+    return 2 * M2S_RATIO;
 }
-static void bit_2_c()
+static uint8_t bit_2_c()
 { // 0x51
     reg_bit_x(BIT_2_MASK, &(R->C));
+    return 2 * M2S_RATIO;
 }
-static void bit_2_d()
+static uint8_t bit_2_d()
 { // 0x52
     reg_bit_x(BIT_2_MASK, &(R->D));
+    return 2 * M2S_RATIO;
 }
-static void bit_2_e()
+static uint8_t bit_2_e()
 { // 0x53
     reg_bit_x(BIT_2_MASK, &(R->E));
+    return 2 * M2S_RATIO;
 }
-static void bit_2_h()
+static uint8_t bit_2_h()
 { // 0x54
     reg_bit_x(BIT_2_MASK, &(R->H));
+    return 2 * M2S_RATIO;
 }
-static void bit_2_l()
+static uint8_t bit_2_l()
 { // 0x55
     reg_bit_x(BIT_2_MASK, &(R->L));
+    return 2 * M2S_RATIO;
 }
-static void bit_2_hl()
+static uint8_t bit_2_hl()
 { // 0x56
     reg_bit_x(BIT_2_MASK, read_memory(getDR(HL_REG)));
+    return 3 * M2S_RATIO;
 }
-static void bit_2_a()
+static uint8_t bit_2_a()
 { // 0x57
     reg_bit_x(BIT_2_MASK, &(R->A));
+    return 2 * M2S_RATIO;
 }
-static void bit_3_b()
+static uint8_t bit_3_b()
 { // 0x58
     reg_bit_x(BIT_3_MASK, &(R->B));
+    return 2 * M2S_RATIO;
 }
-static void bit_3_c()
+static uint8_t bit_3_c()
 { // 0x59
     reg_bit_x(BIT_3_MASK, &(R->C));
+    return 2 * M2S_RATIO;
 }
-static void bit_3_d()
+static uint8_t bit_3_d()
 { // 0x5A
     reg_bit_x(BIT_3_MASK, &(R->D));
+    return 2 * M2S_RATIO;
 }
-static void bit_3_e()
+static uint8_t bit_3_e()
 { // 0x5B
     reg_bit_x(BIT_3_MASK, &(R->E));
+    return 2 * M2S_RATIO;
 }
-static void bit_3_h()
+static uint8_t bit_3_h()
 { // 0x5C
     reg_bit_x(BIT_3_MASK, &(R->H));
+    return 2 * M2S_RATIO;
 }
-static void bit_3_l()
+static uint8_t bit_3_l()
 { // 0x5D
     reg_bit_x(BIT_3_MASK, &(R->L));
+    return 2 * M2S_RATIO;
 }
-static void bit_3_hl()
+static uint8_t bit_3_hl()
 { // 0x5E
     reg_bit_x(BIT_3_MASK, read_memory(getDR(HL_REG)));
+    return 3 * M2S_RATIO;
 }
-static void bit_3_a()
+static uint8_t bit_3_a()
 { // 0x5F
     reg_bit_x(BIT_3_MASK, &(R->A));
+    return 2 * M2S_RATIO;
 }
-static void bit_4_b()
+static uint8_t bit_4_b()
 { // 0x60
     reg_bit_x(BIT_4_MASK, &(R->B));
+    return 2 * M2S_RATIO;
 }
-static void bit_4_c()
+static uint8_t bit_4_c()
 { // 0x61
     reg_bit_x(BIT_4_MASK, &(R->C));
+    return 2 * M2S_RATIO;
 }
-static void bit_4_d()
+static uint8_t bit_4_d()
 { // 0x62
     reg_bit_x(BIT_4_MASK, &(R->D));
+    return 2 * M2S_RATIO;
 }
-static void bit_4_e()
+static uint8_t bit_4_e()
 { // 0x63
     reg_bit_x(BIT_4_MASK, &(R->E));
+    return 2 * M2S_RATIO;
 }
-static void bit_4_h()
+static uint8_t bit_4_h()
 { // 0x64
     reg_bit_x(BIT_4_MASK, &(R->H));
+    return 2 * M2S_RATIO;
 }
-static void bit_4_l()
+static uint8_t bit_4_l()
 { // 0x65
     reg_bit_x(BIT_4_MASK, &(R->L));
+    return 2 * M2S_RATIO;
 }
-static void bit_4_hl()
+static uint8_t bit_4_hl()
 { // 0x66
     reg_bit_x(BIT_4_MASK, read_memory(getDR(HL_REG)));
+    return 3 * M2S_RATIO;
 }
-static void bit_4_a()
+static uint8_t bit_4_a()
 { // 0x67
     reg_bit_x(BIT_4_MASK, &(R->A));
+    return 2 * M2S_RATIO;
 }
-static void bit_5_b()
+static uint8_t bit_5_b()
 { // 0x68
     reg_bit_x(BIT_5_MASK, &(R->B));
+    return 2 * M2S_RATIO;
 }
-static void bit_5_c()
+static uint8_t bit_5_c()
 { // 0x69
     reg_bit_x(BIT_5_MASK, &(R->C));
+    return 2 * M2S_RATIO;
 }
-static void bit_5_d()
+static uint8_t bit_5_d()
 { // 0x6A
     reg_bit_x(BIT_5_MASK, &(R->D));
+    return 2 * M2S_RATIO;
 }
-static void bit_5_e()
+static uint8_t bit_5_e()
 { // 0x6B
     reg_bit_x(BIT_5_MASK, &(R->E));
+    return 2 * M2S_RATIO;
 }
-static void bit_5_h()
+static uint8_t bit_5_h()
 { // 0x6C
     reg_bit_x(BIT_5_MASK, &(R->H));
+    return 2 * M2S_RATIO;
 }
-static void bit_5_l()
+static uint8_t bit_5_l()
 { // 0x6D
     reg_bit_x(BIT_5_MASK, &(R->L));
+    return 2 * M2S_RATIO;
 }
-static void bit_5_hl()
+static uint8_t bit_5_hl()
 { // 0x6E
     reg_bit_x(BIT_5_MASK, read_memory(getDR(HL_REG)));
+    return 3 * M2S_RATIO;
 }
-static void bit_5_a()
+static uint8_t bit_5_a()
 { // 0x6F
     reg_bit_x(BIT_5_MASK, &(R->A));
+    return 2 * M2S_RATIO;
 }
-static void bit_6_b()
+static uint8_t bit_6_b()
 { // 0x70
     reg_bit_x(BIT_6_MASK, &(R->B));
+    return 2 * M2S_RATIO;
 }
-static void bit_6_c()
+static uint8_t bit_6_c()
 { // 0x71
     reg_bit_x(BIT_6_MASK, &(R->C));
+    return 2 * M2S_RATIO;
 }
-static void bit_6_d()
+static uint8_t bit_6_d()
 { // 0x72
     reg_bit_x(BIT_6_MASK, &(R->D));
+    return 2 * M2S_RATIO;
 }
-static void bit_6_e()
+static uint8_t bit_6_e()
 { // 0x73
     reg_bit_x(BIT_6_MASK, &(R->E));
+    return 2 * M2S_RATIO;
 }
-static void bit_6_h()
+static uint8_t bit_6_h()
 { // 0x74
     reg_bit_x(BIT_6_MASK, &(R->H));
+    return 2 * M2S_RATIO;
 }
-static void bit_6_l()
+static uint8_t bit_6_l()
 { // 0x75
     reg_bit_x(BIT_6_MASK, &(R->L));
+    return 2 * M2S_RATIO;
 }
-static void bit_6_hl()
+static uint8_t bit_6_hl()
 { // 0x76
     reg_bit_x(BIT_6_MASK, read_memory(getDR(HL_REG)));
+    return 3 * M2S_RATIO;
 }
-static void bit_6_a()
+static uint8_t bit_6_a()
 { // 0x77
     reg_bit_x(BIT_6_MASK, &(R->A));
+    return 2 * M2S_RATIO;
 }
-static void bit_7_b()
+static uint8_t bit_7_b()
 { // 0x78
     reg_bit_x(BIT_7_MASK, &(R->B));
+    return 2 * M2S_RATIO;
 }
-static void bit_7_c()
+static uint8_t bit_7_c()
 { // 0x79
     reg_bit_x(BIT_7_MASK, &(R->C));
+    return 2 * M2S_RATIO;
 }
-static void bit_7_d()
+static uint8_t bit_7_d()
 { // 0x7A
     reg_bit_x(BIT_7_MASK, &(R->D));
+    return 2 * M2S_RATIO;
 }
-static void bit_7_e()
+static uint8_t bit_7_e()
 { // 0x7B
     reg_bit_x(BIT_7_MASK, &(R->E));
+    return 2 * M2S_RATIO;
 }
-static void bit_7_h()
+static uint8_t bit_7_h()
 { // 0x7C
     reg_bit_x(BIT_7_MASK, &(R->H));
+    return 2 * M2S_RATIO;
 }
-static void bit_7_l()
+static uint8_t bit_7_l()
 { // 0x7D
     reg_bit_x(BIT_7_MASK, &(R->L));
+    return 2 * M2S_RATIO;
 }
-static void bit_7_hl()
+static uint8_t bit_7_hl()
 { // 0x7E
     reg_bit_x(BIT_7_MASK, read_memory(getDR(HL_REG)));
+    return 3 * M2S_RATIO;
 }
-static void bit_7_a()
+static uint8_t bit_7_a()
 { // 0x7F
     reg_bit_x(BIT_7_MASK, &(R->A));
+    return 2 * M2S_RATIO;
 }
 
-static void res_0_b()
+static uint8_t res_0_b()
 { // 0x80
     R->B = (R->B & ~BIT_0_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_0_c()
+static uint8_t res_0_c()
 { // 0x81
     R->C = (R->C & ~BIT_0_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_0_d()
+static uint8_t res_0_d()
 { // 0x82
     R->D = (R->D & ~BIT_0_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_0_e()
+static uint8_t res_0_e()
 { // 0x83
     R->E = (R->E & ~BIT_0_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_0_h()
+static uint8_t res_0_h()
 { // 0x84
     R->H = (R->H & ~BIT_0_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_0_l()
+static uint8_t res_0_l()
 { // 0x85
     R->L = (R->L & ~BIT_0_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_0_hl()
+static uint8_t res_0_hl()
 { // 0x86
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory & ~BIT_0_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) & ~BIT_0_MASK));
+    return 4 * M2S_RATIO;
 }
-static void res_0_a()
+static uint8_t res_0_a()
 { // 0x87
     R->A = (R->A & ~BIT_0_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_1_b()
+static uint8_t res_1_b()
 { // 0x88
     R->B = (R->B & ~BIT_1_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_1_c()
+static uint8_t res_1_c()
 { // 0x89
     R->C = (R->C & ~BIT_1_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_1_d()
+static uint8_t res_1_d()
 { // 0x8A
     R->D = (R->D & ~BIT_1_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_1_e()
+static uint8_t res_1_e()
 { // 0x8B
     R->E = (R->E & ~BIT_1_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_1_h()
+static uint8_t res_1_h()
 { // 0x8C
     R->H = (R->H & ~BIT_1_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_1_l()
+static uint8_t res_1_l()
 { // 0x8D
     R->L = (R->L & ~BIT_1_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_1_hl()
+static uint8_t res_1_hl()
 { // 0x8E
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory & ~BIT_1_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) & ~BIT_1_MASK));
+    return 4 * M2S_RATIO;
 }
-static void res_1_a()
+static uint8_t res_1_a()
 { // 0x8F
     R->A = (R->A & ~BIT_1_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_2_b()
+static uint8_t res_2_b()
 { // 0x90
     R->B = (R->B & ~BIT_2_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_2_c()
+static uint8_t res_2_c()
 { // 0x91
     R->C = (R->C & ~BIT_2_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_2_d()
+static uint8_t res_2_d()
 { // 0x92
     R->D = (R->D & ~BIT_2_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_2_e()
+static uint8_t res_2_e()
 { // 0x93
     R->E = (R->E & ~BIT_2_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_2_h()
+static uint8_t res_2_h()
 { // 0x94
     R->H = (R->H & ~BIT_2_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_2_l()
+static uint8_t res_2_l()
 { // 0x95
     R->L = (R->L & ~BIT_2_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_2_hl()
+static uint8_t res_2_hl()
 { // 0x96
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory & ~BIT_2_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) & ~BIT_2_MASK));
+    return 4 * M2S_RATIO;
 }
-static void res_2_a()
+static uint8_t res_2_a()
 { // 0x97
     R->A = (R->A & ~BIT_2_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_3_b()
+static uint8_t res_3_b()
 { // 0x98
     R->B = (R->B & ~BIT_3_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_3_c()
+static uint8_t res_3_c()
 { // 0x99
     R->C = (R->C & ~BIT_3_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_3_d()
+static uint8_t res_3_d()
 { // 0x9A
     R->D = (R->D & ~BIT_3_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_3_e()
+static uint8_t res_3_e()
 { // 0x9B
     R->E = (R->E & ~BIT_3_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_3_h()
+static uint8_t res_3_h()
 { // 0x9C
     R->H = (R->H & ~BIT_3_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_3_l()
+static uint8_t res_3_l()
 { // 0x9D
     R->L = (R->L & ~BIT_3_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_3_hl()
+static uint8_t res_3_hl()
 { // 0x9E
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory & ~BIT_3_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) & ~BIT_3_MASK));
+    return 4 * M2S_RATIO;
 }
-static void res_3_a()
+static uint8_t res_3_a()
 { // 0x9F
     R->A = (R->A & ~BIT_3_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_4_b()
+static uint8_t res_4_b()
 { // 0xA0
     R->B = (R->B & ~BIT_4_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_4_c()
+static uint8_t res_4_c()
 { // 0xA1
     R->C = (R->C & ~BIT_4_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_4_d()
+static uint8_t res_4_d()
 { // 0xA2
     R->D = (R->D & ~BIT_4_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_4_e()
+static uint8_t res_4_e()
 { // 0xA3
     R->E = (R->E & ~BIT_4_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_4_h()
+static uint8_t res_4_h()
 { // 0xA4
     R->H = (R->H & ~BIT_4_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_4_l()
+static uint8_t res_4_l()
 { // 0xA5
     R->L = (R->L & ~BIT_4_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_4_hl()
+static uint8_t res_4_hl()
 { // 0xA6
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory & ~BIT_4_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) & ~BIT_4_MASK));
+    return 4 * M2S_RATIO;
 }
-static void res_4_a()
+static uint8_t res_4_a()
 { // 0xA7
     R->A = (R->A & ~BIT_4_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_5_b()
+static uint8_t res_5_b()
 { // 0xA8
     R->B = (R->B & ~BIT_5_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_5_c()
+static uint8_t res_5_c()
 { // 0xA9
     R->C = (R->C & ~BIT_5_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_5_d()
+static uint8_t res_5_d()
 { // 0xAA
     R->D = (R->D & ~BIT_5_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_5_e()
+static uint8_t res_5_e()
 { // 0xAB
     R->E = (R->E & ~BIT_5_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_5_h()
+static uint8_t res_5_h()
 { // 0xAC
     R->H = (R->H & ~BIT_5_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_5_l()
+static uint8_t res_5_l()
 { // 0xAD
     R->L = (R->L & ~BIT_5_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_5_hl()
+static uint8_t res_5_hl()
 { // 0xAE
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory & ~BIT_5_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) & ~BIT_5_MASK));
+    return 4 * M2S_RATIO;
 }
-static void res_5_a()
+static uint8_t res_5_a()
 { // 0xAF
     R->A = (R->A & ~BIT_5_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_6_b()
+static uint8_t res_6_b()
 { // 0xB0
     R->B = (R->B & ~BIT_6_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_6_c()
+static uint8_t res_6_c()
 { // 0xB1
     R->C = (R->C & ~BIT_6_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_6_d()
+static uint8_t res_6_d()
 { // 0xB2
     R->D = (R->D & ~BIT_6_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_6_e()
+static uint8_t res_6_e()
 { // 0xB3
     R->E = (R->E & ~BIT_6_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_6_h()
+static uint8_t res_6_h()
 { // 0xB4
     R->H = (R->H & ~BIT_6_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_6_l()
+static uint8_t res_6_l()
 { // 0xB5
     R->L = (R->L & ~BIT_6_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_6_hl()
+static uint8_t res_6_hl()
 { // 0xB6
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory & ~BIT_6_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) & ~BIT_6_MASK));
+    return 4 * M2S_RATIO;
 }
-static void res_6_a()
+static uint8_t res_6_a()
 { // 0xB7
     R->A = (R->A & ~BIT_6_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_7_b()
+static uint8_t res_7_b()
 { // 0xB8
     R->B = (R->B & ~BIT_7_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_7_c()
+static uint8_t res_7_c()
 { // 0xB9
     R->C = (R->C & ~BIT_7_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_7_d()
+static uint8_t res_7_d()
 { // 0xBA
     R->D = (R->D & ~BIT_7_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_7_e()
+static uint8_t res_7_e()
 { // 0xBB
     R->E = (R->E & ~BIT_7_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_7_h()
+static uint8_t res_7_h()
 { // 0xBC
     R->H = (R->H & ~BIT_7_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_7_l()
+static uint8_t res_7_l()
 { // 0xBD
     R->L = (R->L & ~BIT_7_MASK);
+    return 2 * M2S_RATIO;
 }
-static void res_7_hl()
+static uint8_t res_7_hl()
 { // 0xBE
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory & ~BIT_7_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) & ~BIT_7_MASK));
+    return 4 * M2S_RATIO;
 }
-static void res_7_a()
+static uint8_t res_7_a()
 { // 0xBF
     R->A = (R->A & ~BIT_7_MASK);
+    return 2 * M2S_RATIO;
 }
 
-static void set_0_b()
+static uint8_t set_0_b()
 { // 0xC0
     R->B = (R->B | BIT_0_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_0_c()
+static uint8_t set_0_c()
 { // 0xC1
     R->C = (R->C | BIT_0_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_0_d()
+static uint8_t set_0_d()
 { // 0xC2
     R->D = (R->D | BIT_0_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_0_e()
+static uint8_t set_0_e()
 { // 0xC3
     R->E = (R->E | BIT_0_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_0_h()
+static uint8_t set_0_h()
 { // 0xC4
     R->H = (R->H | BIT_0_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_0_l()
+static uint8_t set_0_l()
 { // 0xDD
-    R->L = (R->L | BIT_1_MASK);
+    R->L = (R->L | BIT_0_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_0_hl()
+static uint8_t set_0_hl()
 { // 0xC5
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory | BIT_0_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) | BIT_0_MASK));
+    return 4 * M2S_RATIO;
 }
-static void set_0_a()
+static uint8_t set_0_a()
 { // 0xC7
     R->A = (R->A | BIT_0_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_1_b()
+static uint8_t set_1_b()
 { // 0xC8
     R->B = (R->B | BIT_1_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_1_c()
+static uint8_t set_1_c()
 { // 0xC9
     R->C = (R->C | BIT_1_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_1_d()
+static uint8_t set_1_d()
 { // 0xCA
     R->D = (R->D | BIT_1_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_1_e()
+static uint8_t set_1_e()
 { // 0xCB
     R->E = (R->E | BIT_1_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_1_h()
+static uint8_t set_1_h()
 { // 0xCC
     R->H = (R->H | BIT_1_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_1_l()
+static uint8_t set_1_l()
 { // 0xCD
     R->L = (R->L | BIT_1_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_1_hl()
+static uint8_t set_1_hl()
 { // 0xCE
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory | BIT_1_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) | BIT_1_MASK));
+    return 4 * M2S_RATIO;
 }
-static void set_1_a()
+static uint8_t set_1_a()
 { // 0xCF
     R->A = (R->A | BIT_1_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_2_b()
+static uint8_t set_2_b()
 { // 0xC0
     R->B = (R->B | BIT_2_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_2_c()
+static uint8_t set_2_c()
 { // 0xC1
     R->C = (R->C | BIT_2_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_2_d()
+static uint8_t set_2_d()
 { // 0xC2
     R->D = (R->D | BIT_2_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_2_e()
+static uint8_t set_2_e()
 { // 0xC3
     R->E = (R->E | BIT_2_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_2_h()
+static uint8_t set_2_h()
 { // 0xC4
     R->H = (R->H | BIT_2_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_2_l()
+static uint8_t set_2_l()
 { // 0xC5
     R->L = (R->L | BIT_2_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_2_hl()
+static uint8_t set_2_hl()
 { // 0xC6
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory | BIT_2_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) | BIT_2_MASK));
+    return 4 * M2S_RATIO;
 }
-static void set_2_a()
+static uint8_t set_2_a()
 { // 0xC7
     R->A = (R->A | BIT_2_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_3_b()
+static uint8_t set_3_b()
 { // 0xC8
     R->B = (R->B | BIT_3_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_3_c()
+static uint8_t set_3_c()
 { // 0xC9
     R->C = (R->C | BIT_3_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_3_d()
+static uint8_t set_3_d()
 { // 0xCA
     R->D = (R->D | BIT_3_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_3_e()
+static uint8_t set_3_e()
 { // 0xCB
     R->E = (R->E | BIT_3_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_3_h()
+static uint8_t set_3_h()
 { // 0xCC
     R->H = (R->H | BIT_3_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_3_l()
+static uint8_t set_3_l()
 { // 0xCD
     R->L = (R->L | BIT_3_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_3_hl()
+static uint8_t set_3_hl()
 { // 0xCE
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory | BIT_3_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) | BIT_3_MASK));
+    return 4 * M2S_RATIO;
 }
-static void set_3_a()
+static uint8_t set_3_a()
 { // 0xCF
     R->A = (R->A | BIT_3_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_4_b()
+static uint8_t set_4_b()
 { // 0xD0
     R->B = (R->B | BIT_4_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_4_c()
+static uint8_t set_4_c()
 { // 0xD1
     R->C = (R->C | BIT_4_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_4_d()
+static uint8_t set_4_d()
 { // 0xD2
     R->D = (R->D | BIT_4_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_4_e()
+static uint8_t set_4_e()
 { // 0xD3
     R->E = (R->E | BIT_4_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_4_h()
+static uint8_t set_4_h()
 { // 0xD4
     R->H = (R->H | BIT_4_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_4_l()
+static uint8_t set_4_l()
 { // 0xD5
     R->L = (R->L | BIT_4_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_4_hl()
+static uint8_t set_4_hl()
 { // 0xD6
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory | BIT_4_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) | BIT_4_MASK));
+    return 4 * M2S_RATIO;
 }
-static void set_4_a()
+static uint8_t set_4_a()
 { // 0xD7
     R->A = (R->A | BIT_4_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_5_b()
+static uint8_t set_5_b()
 { // 0xD8
     R->B = (R->B | BIT_5_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_5_c()
+static uint8_t set_5_c()
 { // 0xD9
     R->C = (R->C | BIT_5_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_5_d()
+static uint8_t set_5_d()
 { // 0xDA
     R->D = (R->D | BIT_5_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_5_e()
+static uint8_t set_5_e()
 { // 0xDB
     R->E = (R->E | BIT_5_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_5_h()
+static uint8_t set_5_h()
 { // 0xDC
     R->H = (R->H | BIT_5_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_5_l()
+static uint8_t set_5_l()
 { // 0xDD
     R->L = (R->L | BIT_5_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_5_hl()
+static uint8_t set_5_hl()
 { // 0xDE
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory | BIT_5_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) | BIT_5_MASK));
+    return 4 * M2S_RATIO;
 }
-static void set_5_a()
+static uint8_t set_5_a()
 { // 0xDF
     R->A = (R->A | BIT_5_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_6_b()
+static uint8_t set_6_b()
 { // 0xF0
-    R->B = (R->B | BIT_5_MASK);
+    R->B = (R->B | BIT_6_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_6_c()
+static uint8_t set_6_c()
 { // 0xF1
     R->C = (R->C | BIT_6_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_6_d()
+static uint8_t set_6_d()
 { // 0xF2
     R->D = (R->D | BIT_6_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_6_e()
+static uint8_t set_6_e()
 { // 0xF3
     R->E = (R->E | BIT_6_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_6_h()
+static uint8_t set_6_h()
 { // 0xF4
     R->H = (R->H | BIT_6_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_6_l()
+static uint8_t set_6_l()
 { // 0xF5
     R->L = (R->L | BIT_6_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_6_hl()
+static uint8_t set_6_hl()
 { // 0xF6
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory | BIT_6_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) | BIT_6_MASK));
+    return 4 * M2S_RATIO;
 }
-static void set_6_a()
+static uint8_t set_6_a()
 { // 0xF7
     R->A = (R->A | BIT_6_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_7_b()
+static uint8_t set_7_b()
 { // 0xF8
     R->B = (R->B | BIT_7_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_7_c()
+static uint8_t set_7_c()
 { // 0xF9
     R->C = (R->C | BIT_7_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_7_d()
+static uint8_t set_7_d()
 { // 0xFA
     R->D = (R->D | BIT_7_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_7_e()
+static uint8_t set_7_e()
 { // 0xFB
     R->E = (R->E | BIT_7_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_7_h()
+static uint8_t set_7_h()
 { // 0xFC
     R->H = (R->H | BIT_7_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_7_l()
+static uint8_t set_7_l()
 { // 0xFD
     R->L = (R->L | BIT_7_MASK);
+    return 2 * M2S_RATIO;
 }
-static void set_7_hl()
+static uint8_t set_7_hl()
 { // 0xFE
-    uint8_t *memory = read_memory(getDR(HL_REG));
-    write_memory(getDR(HL_REG), (*memory | BIT_7_MASK));
+    uint16_t address = getDR(HL_REG);
+    write_memory(address, (*read_memory(address) | BIT_7_MASK));
+    return 4 * M2S_RATIO;
 }
-static void set_7_a()
+static uint8_t set_7_a()
 { // 0xFF
     R->A = (R->A | BIT_7_MASK);
+    return 2 * M2S_RATIO;
 }
 
 OpcodeHandler prefix_opcode_table[256] = 
@@ -3011,7 +3560,7 @@ OpcodeHandler prefix_opcode_table[256] =
     /* 0x14 */ [RL_H]      = rl_h,
     /* 0x15 */ [RL_L]      = rl_l,
     /* 0x16 */ [RL_HL]     = rl_hl,
-    /* 0x17 */ [RL_A]      = rr_a,
+    /* 0x17 */ [RL_A]      = rl_a,
     /* 0x18 */ [RR_B]      = rr_b,
     /* 0x19 */ [RR_C]      = rr_c,
     /* 0x1A */ [RR_D]      = rr_d,
@@ -3106,14 +3655,14 @@ OpcodeHandler prefix_opcode_table[256] =
     /* 0x6E */ [BIT_5_HL]  = bit_5_hl,
     /* 0x6F */ [BIT_5_A]   = bit_5_a,
     /*              ROW 8                */
-    /* 0x70 */ [BIT_6_B]   = bit_7_b,   
-    /* 0x71 */ [BIT_6_C]   = bit_7_c,
-    /* 0x72 */ [BIT_6_D]   = bit_7_d,
-    /* 0x73 */ [BIT_6_E]   = bit_7_e,
-    /* 0x74 */ [BIT_6_H]   = bit_7_h,
-    /* 0x75 */ [BIT_6_L]   = bit_7_l,
-    /* 0x76 */ [BIT_6_HL]  = bit_7_hl,
-    /* 0x77 */ [BIT_6_A]   = bit_7_a,
+    /* 0x70 */ [BIT_6_B]   = bit_6_b,   
+    /* 0x71 */ [BIT_6_C]   = bit_6_c,
+    /* 0x72 */ [BIT_6_D]   = bit_6_d,
+    /* 0x73 */ [BIT_6_E]   = bit_6_e,
+    /* 0x74 */ [BIT_6_H]   = bit_6_h,
+    /* 0x75 */ [BIT_6_L]   = bit_6_l,
+    /* 0x76 */ [BIT_6_HL]  = bit_6_hl,
+    /* 0x77 */ [BIT_6_A]   = bit_6_a,
     /* 0x78 */ [BIT_7_B]   = bit_7_b,
     /* 0x79 */ [BIT_7_C]   = bit_7_c,
     /* 0x7A */ [BIT_7_D]   = bit_7_d,
@@ -3178,11 +3727,11 @@ OpcodeHandler prefix_opcode_table[256] =
     /* 0xB1 */ [RES_6_C]   = res_6_c,
     /* 0xB2 */ [RES_6_D]   = res_6_d,
     /* 0xB3 */ [RES_6_E]   = res_6_e,
-    /* 0xB4 */ [RES_6_H]   = res_6_l,
-    /* 0xB5 */ [RES_6_L]   = res_6_h,
+    /* 0xB4 */ [RES_6_H]   = res_6_h,
+    /* 0xB5 */ [RES_6_L]   = res_6_l,
     /* 0xB6 */ [RES_6_HL]  = res_6_hl,
     /* 0xB7 */ [RES_6_A]   = res_6_a,
-    /* 0xB8 */ [RES_7_B]   = res_6_b,
+    /* 0xB8 */ [RES_7_B]   = res_7_b,
     /* 0xB9 */ [RES_7_C]   = res_7_c,
     /* 0xBA */ [RES_7_D]   = res_7_d,
     /* 0xBB */ [RES_7_E]   = res_7_e,
@@ -3261,27 +3810,78 @@ OpcodeHandler prefix_opcode_table[256] =
     /*           END OPCODES               */
 };
 
-static void execute_opcode(uint8_t opcode)
+static uint8_t execute_opcode(uint8_t opcode)
 {
-    if(cpu->interrupt_enabled == IE_NEXT_INS) cpu->interrupt_enabled = true;
-    if(cpu->testing) printf(" | %s\n", opcode_word[opcode]);
+    char byte_buffer[BYTE];
     if (opcode == CB_PREFIX)
     {
-        prefix_opcode_table[opcode]();
+        uint8_t cb_opcode = fetch();
+        LOG_MESSAGE(DEBUG, "%s", cb_opcode_word[cb_opcode]);
+        uint8_t cycles = prefix_opcode_table[cb_opcode]();
+        return cycles;
     }
     else
     {
-        opcode_table[opcode]();
+        LOG_MESSAGE(DEBUG, "%s", opcode_word[opcode]);
+        uint8_t cycles = opcode_table[opcode]();
+        return cycles;
     }
+}
+
+static uint8_t service_interrupts()
+{
+    if (!cpu->ime) return 0;
+    uint8_t ier = *read_memory(IE);
+    uint8_t ifr = *read_memory(IF);
+    uint8_t triggered_interrupts = ier & ifr;
+    if (triggered_interrupts)
+    {
+        cpu->ime = false;
+        if (triggered_interrupts & VBLANK_INTERRUPT_CODE)
+        { // VBlank Interrupt
+            write_memory(IF, ifr & ~VBLANK_INTERRUPT_CODE);
+            ld_stack_pc();
+            R->PC = VBLANK_VECTOR;
+            return 5;
+        }
+        if (triggered_interrupts & LCD_STAT_INTERRUPT_CODE)
+        { // LCD Stat
+            write_memory(IF, ifr & ~LCD_STAT_INTERRUPT_CODE);
+            ld_stack_pc();
+            R->PC = LCD_VECTOR;
+            return 5;
+        }
+        if (triggered_interrupts & TIMER_INTERRUPT_CODE)
+        { // Timer
+            write_memory(IF, ifr & ~TIMER_INTERRUPT_CODE);
+            ld_stack_pc();
+            R->PC = TIMER_VECTOR;
+            return 5;
+        }
+        if (triggered_interrupts & SERIAL_INTERRUPT_CODE)
+        { // Serial
+            write_memory(IF, ifr & ~SERIAL_INTERRUPT_CODE);
+            ld_stack_pc();
+            R->PC = SERIAL_VECTOR;
+            return 5;
+        }
+        if (triggered_interrupts & JOYPAD_INTERRUPT_CODE)
+        { // Joypad
+            write_memory(IF, ifr & ~JOYPAD_INTERRUPT_CODE);
+            ld_stack_pc();
+            R->PC = JOYPAD_VECTOR;
+            return 5;
+        }
+    }
+    return 0;
 }
 
 /* CLIENT (PUBLIC) FUNCTIONS */
 
-bool init_cpu(bool testing)
+bool init_cpu()
 {
     // init pointers
     cpu    = (CPU*)      malloc(sizeof(CPU));
-    memory = (uint8_t*)  malloc(BUS_MEMORY_SIZE);
     R      = (Register*) malloc(sizeof(Register));
     cpu->ins_length = 0;
     // init registers
@@ -3289,54 +3889,46 @@ bool init_cpu(bool testing)
     R->B = R->C = DEFAULT_8BIT_REG_VAL;
     R->D = R->E = DEFAULT_8BIT_REG_VAL;
     R->H = R->L = DEFAULT_8BIT_REG_VAL;  
-    cpu->interrupt_enabled = true;
+    cpu->ime               = false;
+    cpu->ime_scheduled     = false;
     cpu->speed_enabled     = false;
     cpu->cpu_running       = true;
-    cpu->testing           = testing; 
+    cpu->halted            = false;
+    cpu->halt_bug_active   = false;
     // init SP and PC registers.
     R->PC = get_rom_start();
     R->SP = HIGH_RAM_ADDRESS_END;
-    printf("CPU Initialized...\n\n");
     return true;
 }
 
-bool machine_cycle()
+
+uint8_t machine_cycle()
 {
-    uint8_t opcode = fetch();
-    printf("%02X", opcode);
-    if (opcode == HALT) 
-    { 
-        printf(" | %s\n", opcode_word[opcode]);
-        halt(); 
-        return false;
-    }
-    reset_cycles();
+    uint8_t cycles = 0;
     cpu->ins_length = 0;
-    execute_opcode(opcode);
-    return cpu->cpu_running;
-}
-
-CPU *get_cpu_info()
-{
-    return cpu;
-}
-
-Register *get_register_bank()
-{
-    return R; 
-}
-
-uint8_t *get_cpu_memory()
-{
-    return memory;
+    if (cpu->halted) return M2S_RATIO;
+    if (cpu->halt_bug_active)
+    {
+        cpu->halt_bug_active = false;
+        R->PC += 1;
+    }
+    if (cpu->ime_scheduled)
+    {
+        cpu->ime = true;
+        cpu->ime_scheduled = false;
+    }
+    LOG_MESSAGE(DEBUG, "--------------------------");
+    LOG_MESSAGE(DEBUG, "%04X", R->PC);
+    cycles += service_interrupts();
+    uint8_t opcode = fetch();
+    cycles += execute_opcode(opcode);
+    return cycles;
 }
 
 void tidy_cpu()
 {
     free(cpu);
     cpu = NULL;
-    free(memory);
-    memory = NULL;
     free(R);
     R = NULL;
 }
@@ -3346,12 +3938,40 @@ void reset_pc()
     R->PC = get_rom_start();
 }
 
-void set_cpu_running(bool is_running)
+void start_cpu()
 {
-    cpu->cpu_running = is_running;
+    cpu->cpu_running = true;
+}
+
+void stop_cpu()
+{
+    cpu->cpu_running = false;
+}
+
+bool is_speed_enabled()
+{
+    return cpu->speed_enabled;
+}
+
+bool cpu_running()
+{
+    return cpu->cpu_running;
 }
 
 uint8_t get_ins_length()
 {
     return cpu->ins_length;
 }
+
+Register *get_register_bank()
+{
+    return R; 
+}
+
+void request_interrupt(InterruptCodes interrupt)
+{ // Note: Codes double as bitmask.
+    uint8_t ifr = *read_memory(IF);
+    write_memory(IF, ifr | interrupt);
+    cpu->halted = false;
+}
+

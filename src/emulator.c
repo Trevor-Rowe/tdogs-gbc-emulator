@@ -1,35 +1,31 @@
 #include <stdlib.h>
 #include "emulator.h"
-#include "cartridge.h"
+#include "cart.h"
 #include "cpu.h"
-#include "clock.h"
+#include "logger.h"
+#include "mmu.h"
+#include "ppu.h"
 
-static EmulatorState *emu_state;
-
-void start_emulator()
-{
-    set_cpu_running(true);
-    emu_state->running = true;
-    while(emu_state->running)
-    {
-       emu_state->running = machine_cycle();
-    }
-}
+#define LOG_MESSAGE(level, format, ...) log_message(level, __FILE__, __func__, format, ##__VA_ARGS__)
 
 void tidy_emulator()
 {
-    tidy_clock();
+    tidy_memory();
     tidy_cpu();
     tidy_cartridge();
-    free(emu_state);
-    emu_state = NULL;
+    tidy_graphics();
 }
 
-void init_emulator(char *file_path, bool testing)
+void init_emulator(char *file_path, uint16_t entry)
 {
-    emu_state = (EmulatorState*) malloc(sizeof(EmulatorState));
-    init_clock();
-    set_freq(100);
-    init_cartridge(file_path, testing);
-    init_cpu(testing);
+    LOG_MESSAGE(INFO, "Clock initialized.");
+    init_memory(BUS_MEMORY_SIZE);
+    LOG_MESSAGE(INFO, "Memory initialized.");
+    init_cartridge(file_path, entry);
+    LOG_MESSAGE(INFO, "Cartridge initialized.");
+    print_cartridge();
+    init_cpu();
+    LOG_MESSAGE(INFO, "CPU initialized.");
+    init_graphics();
+    LOG_MESSAGE(INFO, "Graphics initialized.");
 }
