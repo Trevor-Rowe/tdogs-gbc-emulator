@@ -1,13 +1,8 @@
 #ifndef EMULATOR_H
 #define EMULATOR_H
+#include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
-
-typedef struct
-{
-    bool running;
-
-} EmulatorState;
 
 /*
     Initializes emulator and all its dependencies.
@@ -15,17 +10,15 @@ typedef struct
     @param testing  : flag for extra debug info.
     @note: CALL THIS FIRST.
 */
-void init_emulator(char *file_path, bool testing);
-
-/* 
-    Starts program execution.
-    @note: CALL THIS SECOND.
-*/
-void start_emulator();
+void init_emulator(char *file_path, uint16_t entry);
 
 /*
     Stops emulator and tidies up.
 */
 void tidy_emulator();
+
+int start_emulator(void *data);
+
+void stop_emulator();
 
 #endif
