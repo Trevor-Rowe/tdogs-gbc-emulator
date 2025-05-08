@@ -1,100 +1,134 @@
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
-#include "cart.h"
-#include "common.h"
-#include "cpu.h"
-#include "emulator.h"
-#include "logger.h"
-#include "mmu.h"
-#include "ppu.h"
-#include "util.h"
+#include "cart.h"   // Used to determine DMG or CGB
+#include "common.h" // Essential enums for readibility
+#include "cpu.h"    // Interrupt requesting
+#include "logger.h" // Console or file logs
+#include "mmu.h"    // Reading hardware memory
+#include "ppu.h"    // Header file
+#include "util.h"   // Queue implementation
 
 #define LOG_MESSAGE(level, format, ...) log_message(level, __FILE__, __func__, format, ##__VA_ARGS__)
 
 typedef enum
 {
-    WHITE      = 0xFFE0F8D0,
-    LIGHT_GRAY = 0xFF88C070,
-    DARK_GRAY  = 0xFF346856,
-    BLACK      = 0xFF081820
+    GET_TILE     = 1,
+    GET_TDL      = 2,
+    GET_TDH      = 3,
+    SLEEP        = 4,
+    PUSH         = 5,
+    PAD_OAM_FIFO = 6,
 
-} DmgColors;
+} FetcherStep;
 
 typedef struct
 {
-    uint16_t     oam;
-    uint16_t drawing;
-    uint16_t h_blank;
-    uint16_t v_blank;
+    FetcherStep   step;
 
-} PpuDelayEmulation;
+    uint8_t   duration;
+    uint8_t       tile;
+    uint8_t        lsb;
+    uint8_t        msb;
+    uint8_t       attr;
+    uint8_t          x;
 
-static uint32_t          *lcd;
-static Queue        *bgw_fifo;
-static Queue        *obj_fifo;
-static Queue        *obj_scan;
-static GbcPixel *pixel_schema;
-static uint8_t        *memory;
+    bool    row_pushed;
 
-/* CREATE AND DESTROY WINDOW */
-bool init_graphics()
+    (*handler)(struct PpuState*);
+
+} PixelFetcher;
+
+typedef struct
 {
-    bgw_fifo     = init_queue(GBC_WIDTH);
-    obj_fifo     = init_queue(GBC_WIDTH);
-    obj_scan     = init_queue(OBJ_PER_LINE);
-    pixel_schema = (GbcPixel*) malloc(sizeof(GbcPixel));
-    lcd          = (uint32_t*) malloc(GBC_HEIGHT * GBC_WIDTH * sizeof(uint32_t));
-    memory       = get_memory();
+    // 160px by 144px LCD Display
+    uint32_t   *lcd;
+    // Control
+    uint8_t   *lcdc;
+    uint8_t   *stat;
+    uint8_t    *lyc;
+    // Scanline
+    uint8_t penalty;
+    uint8_t      lx;
+    uint8_t     *ly;
+    // Background
+    uint8_t    *scx;
+    uint8_t    *scy;
+    // Window
+    uint8_t     *wx;
+    uint8_t     *wy;
+    // DMG Palettes
+    uint8_t    *bgp;
+    uint8_t   *opd0;
+    uint8_t   *opd1;
+    // Flags
+    bool   sc_complete;
+    bool obj_rendering;
+    bool win_rendering;
+
+} PpuState;
+
+static PpuState              *ppu;
+
+static PixelFetcher  *bgw_fetcher;
+static PixelFetcher  *obj_fetcher;
+static GbcPixel     *pixel_schema;
+static Queue        *bgw_pix_fifo;
+static Queue        *obj_pix_fifo;
+static Queue            *oam_fifo;
+
+/* ================== GLOBAL        ================== */
+
+static void reset_fetcher(PixelFetcher *fetcher)
+{
+    fetcher->      step = GET_TILE;
+    fetcher->  duration =        0;
+    fetcher->       lsb =        0;
+    fetcher->       msb =        0;
+    fetcher->      tile =        0;
+    fetcher->      attr =        0;
+    fetcher->         x =        0;
+    fetcher->row_pushed =    false;
 }
 
-void tidy_graphics()
+static void reset_ppu(PpuState *ppu)
 {
-    free(lcd);
-    lcd = NULL;
-    free(pixel_schema);
-    pixel_schema = NULL;
-    tidy_queue(bgw_fifo);
-    tidy_queue(obj_fifo);
-    tidy_queue(obj_scan);
+    ppu->           lx =     0;
+    ppu->           ly =     0;
+    ppu->      penalty =     0;
+
+    ppu->  sc_complete = false;
+    ppu->obj_rendering = false;
+    ppu->win_rendering = false;
 }
 
-static void oam_scan(uint8_t ly)
-{ // Scans for visible object on given scanline. (MODE 2)
-   uint16_t current_entry = OAM_ADDRESS_START;
-   bool stacked = (bool) (memory[LCDC] & BIT_1_MASK);
-   reset_queue(obj_scan);
-   while(current_entry < OAM_ADDRESS_END)
-   {
-        uint8_t      y_obj = memory[current_entry];
-        uint8_t      x_obj = memory[current_entry + 1];
-        uint8_t tile_index = memory[current_entry + 2];
-        uint8_t  tile_attr = memory[current_entry + 3];
-        bool visible = (0 < (ly - y_obj + 16)) && ((ly - y_obj + 16) < (8 + (8 * stacked)));
-        if(visible) 
-        {
-            pixel_schema->oam_address  = current_entry;
-            pixel_schema->       x_obj = x_obj;
-            pixel_schema->       y_obj = y_obj;
-            pixel_schema->  tile_index = tile_index;
-            pixel_schema->obj_priority = tile_attr & BIT_7_MASK;
-            pixel_schema->      y_flip = tile_attr & BIT_6_MASK;
-            pixel_schema->      x_flip = tile_attr & BIT_5_MASK;
-            pixel_schema-> dmg_palette = (tile_attr & BIT_4_MASK) >> 4;
-            pixel_schema->        bank = (tile_attr & BIT_3_MASK) >> 3;
-            pixel_schema-> gbc_palette = tile_attr & LOWER_3_MASK; 
-            enqueue(obj_scan, pixel_schema);
-        }
-        current_entry += OAM_ENTRY_SIZE;
-   }
-   if (!is_empty(obj_scan)) sort_oam_by_xpos(obj_scan);
+static void init_registers(PpuState *reg)
+{
+    reg->lcdc = get_memory_pointer(LCDC);
+    reg->stat = get_memory_pointer(STAT);
+    reg-> lyc =  get_memory_pointer(LYC); 
+    
+    reg-> scx =  get_memory_pointer(SCX);
+    reg-> scy =  get_memory_pointer(SCY);
+    
+    reg->  wx =   get_memory_pointer(WX);
+    reg->  wy =   get_memory_pointer(WY);
+
+    reg-> bgp =  get_memory_pointer(BGP);
+    reg->opd0 = get_memory_pointer(OBP0);
+    reg->opd1 = get_memory_pointer(OBP1); 
 }
 
-static bool drawing_window(uint8_t lx, uint8_t ly)
+/* ================== DRAWING       ================== */
+
+/* DRAW METHODOLOGY | -------> COLOR AND EMPTY PIXEL   */
+
+static GbcPixel *empty_pixel()
 {
-    bool win_enabled = (bool)(memory[LCDC] & BIT_5_MASK);
-    uint8_t WX = memory[WX];
-    uint8_t WY = memory[WY];
-    return ((lx >= WX) && (ly >= WY) && win_enabled); 
+    pixel_schema->color_id     = 0;
+    pixel_schema->bg_priority  = false;
+    pixel_schema->obj_priority = false;
+    return pixel_schema;
 }
 
 static uint32_t get_argb(uint8_t lsb, uint8_t msb)
@@ -104,315 +138,612 @@ static uint32_t get_argb(uint8_t lsb, uint8_t msb)
     uint8_t green  = ((color >>  5) & LOWER_5_MASK) << 3;
     uint8_t  blue  = ((color >> 10) & LOWER_5_MASK) << 3;
     uint32_t argb  = 
-    (0xFF << (BYTE * 3)) | (red << (BYTE * 2)) | (blue << (BYTE * 1)) | green;
+    (0xFF << (BYTE * 3)) | (red << (BYTE * 2)) | (green << (BYTE * 1)) | blue;
     return argb;
 }
 
-static uint8_t copy_bgw_attributes(uint16_t tma)
-{ // always pull from bank 1
-    uint8_t attributes = *read_vram(TILE_MAP_BANK_1, tma);
-    pixel_schema->bg_priority = (bool)    (attributes & BIT_7_MASK);
-    pixel_schema->y_flip      = (bool)    (attributes & BIT_6_MASK);
-    pixel_schema->x_flip      = (bool)    (attributes & BIT_5_MASK);
-    pixel_schema->bank        = (uint8_t) ((attributes >> 3) & BIT_0_MASK);
-    pixel_schema->gbc_palette = (uint8_t) (attributes & LOWER_3_MASK);
-    return pixel_schema->bank;
-}
-
-static void empty_pixel(uint8_t lx, uint8_t ly)
+static uint32_t get_dmg_shade(uint8_t id)
 {
-    pixel_schema->color_id = IS_ZERO;
-    pixel_schema->  x_draw = lx;
-    pixel_schema->  y_draw = ly;
-}
-
-static void load_bg_pixel(uint8_t lx, uint8_t ly)
-{
-    // Time Map Index (tmi) Calculation.
-    uint8_t    scx  = memory[SCX];
-    uint8_t    scy  = memory[SCY];
-    uint8_t tile_x  = ((scx + lx) / TILE_SIZE) % GRID_SIZE;
-    uint8_t  pix_x  = (scx + lx) % TILE_SIZE;
-    uint8_t tile_y  = ((scy + ly) / TILE_SIZE) % GRID_SIZE;
-    uint8_t  pix_y  = (scy + ly) % TILE_SIZE;
-    bool map_select = ((bool) (memory[LCDC] & BIT_3_MASK)); // Tile Map $9C00?  
-    uint16_t    tmb = map_select ? TM1_ADDRESS_START : TM0_ADDRESS_START;
-    uint16_t    tma = tmb + tile_x + (tile_y * GRID_SIZE);
-    uint8_t    bank = is_gbc() ? copy_bgw_attributes(tma) : TILE_MAP_BANK_0;
-    if (pixel_schema->y_flip) pix_y = TILE_SIZE - 1 - pix_y;
-    if (pixel_schema->x_flip) pix_x = TILE_SIZE - 1 - pix_x;
-    // Obtaining Tile Data.
-    uint8_t line_lsb, line_msb;
-    bool method = (bool) (memory[LCDC] & BIT_4_MASK);
-    uint16_t tile_index = method ? // True = $8000U, False = $9000S
-    (B0_ADDRESS_START + ((uint8_t) *read_vram(bank, tma) * TILE_SIZE * 2) + (pix_y * 2)):
-    (B2_ADDRESS_START + ( (int8_t) *read_vram(bank, tma) * TILE_SIZE * 2) + (pix_y * 2));
-    line_lsb = *read_vram(bank, tile_index);
-    line_msb = *read_vram(bank, tile_index + 1);
-    // Load pixel into queue.
-    bool color_lsb = (line_lsb >> (TILE_SIZE - 1 - pix_x)) & BIT_0_MASK;
-    bool color_msb = (line_msb >> (TILE_SIZE - 1 - pix_x)) & BIT_0_MASK;
-    pixel_schema->color_id = (color_msb << 1) | color_lsb;
-    pixel_schema->x_draw = lx;
-    pixel_schema->y_draw = ly;
-    enqueue(bgw_fifo, pixel_schema);
-}
-
-static void load_win_pixel(uint8_t lx, uint8_t ly)
-{
-    // Time Map Index (tmi) Calculation. (Relative positioning for Window) (NO WRAPPING)
-    uint8_t       wx = memory[WX];
-    uint8_t       wy = memory[WY];
-    uint8_t   tile_x = (lx - wx) / TILE_SIZE;
-    uint8_t    pix_x = (lx - wx) % TILE_SIZE;
-    uint8_t   tile_y = (ly - wy) / TILE_SIZE;
-    uint8_t    pix_y = (ly - wy) % TILE_SIZE;
-    bool map_select = ((bool) (memory[LCDC] & BIT_5_MASK)); // Tile Map $9C00?  
-    uint16_t    tmb = map_select ? TM1_ADDRESS_START : TM0_ADDRESS_START;
-    uint16_t    tma = tmb + tile_x + (tile_y * GRID_SIZE); 
-    uint8_t     bank = is_gbc() ? copy_bgw_attributes(tma) : TILE_MAP_BANK_0;
-    if (pixel_schema->y_flip) pix_y = TILE_SIZE - 1 - pix_y;
-    if (pixel_schema->x_flip) pix_x = TILE_SIZE - 1 - pix_x;
-    // Obtaining Tile Data.
-    uint8_t line_lsb, line_msb;
-    bool method = (bool) (memory[LCDC] & BIT_4_MASK);
-    uint16_t tli = method ? // True = $8000U, False = $9000S
-    (B0_ADDRESS_START + ((uint8_t) *read_vram(bank, tma) * TILE_SIZE * 2) + (pix_y * 2)):
-    (B2_ADDRESS_START + ( (int8_t) *read_vram(bank, tma) * TILE_SIZE * 2) + (pix_y * 2));
-    line_lsb = *read_vram(bank, tli);
-    line_msb = *read_vram(bank, tli + 1);
-    // Load pixel into queue.
-    bool color_lsb = (line_lsb >> (TILE_SIZE - 1 - pix_x)) & BIT_0_MASK;
-    bool color_msb = (line_msb >> (TILE_SIZE - 1 - pix_x)) & BIT_0_MASK;
-    pixel_schema->color_id = (color_msb << 1) | color_lsb;
-    pixel_schema->x_draw = lx;
-    pixel_schema->y_draw = ly;
-    enqueue(bgw_fifo, pixel_schema);
-}
-
-static void load_bgw(uint8_t ly)
-{
-    uint8_t lx = 0;
-    while (lx < GBC_WIDTH)
+    uint32_t result = WHITE;
+    switch(id)
     {
-        drawing_window(lx, ly)? 
-        load_win_pixel(lx, ly): 
-        load_bg_pixel(lx, ly);
-        lx += 1; 
+        case 0: result =      WHITE; break;
+        case 1: result = LIGHT_GRAY; break;
+        case 2: result =  DARK_GRAY; break;
+        case 3: result =      BLACK; break;
+    }
+    return result;
+}
+
+/* DRAW METHODOLOGY | -------> LOGIC AND CONTROL FLOW */
+
+static bool drawing_window(PpuState *ppu)
+{
+    uint8_t lcdc = (*ppu->lcdc);
+    uint8_t   lx =  (ppu->lx); uint8_t ly = (*ppu->ly);
+    uint8_t   wx = (*ppu->wx); uint8_t wy = (*ppu->wy);
+    return ((lx >= (wx - 7)) && (ly >= wy) && (lcdc & BIT_5_MASK));
+}
+
+static bool obj_on_scanline(PpuState *ppu)
+{
+    if (is_empty(oam_fifo)) return false;
+    GbcPixel *obj = peek(oam_fifo);
+    return ((ppu->lx) == (obj->x - 8)) && ((*ppu->lcdc) & BIT_1_MASK);
+}
+
+static bool drawing_obj(GbcPixel *obj, GbcPixel *bgw, PpuState *ppu)
+{ // Merge logic
+    
+    if (is_gbc()) // CGB
+    {
+        bool bgw_disabled = (((*ppu->lcdc) & BIT_0_MASK) == 0); 
+
+        if (bgw_disabled || (obj->color_id == 0)) 
+        {
+            return false;
+        }
+
+        if (bgw-> color_id == 0)
+        {
+            return true;
+        }
+
+        if (obj->obj_priority == 0)
+        {
+            return true;
+        }
+
+        return false;
+    }
+    
+    // DMG
+    
+    if (obj->color_id != 0)
+    {
+        return false;
+    }
+
+    if ((obj->obj_priority != 0) && (bgw->color_id != 0))
+    {
+        return false;
+    }
+
+    return true;   
+    
+}
+
+/* DRAW METHODOLOGY | -------> DRAWING PIXELS        */
+
+static uint32_t draw_obj_pixel(GbcPixel *pixel)
+{
+    if(is_gbc())
+    {
+        uint8_t lsb = read_cram(true, pixel->gbc_palette, pixel->color_id, 0);
+        uint8_t msb = read_cram(true, pixel->gbc_palette, pixel->color_id, 1);
+        return get_argb(lsb, msb); 
+    }
+    else
+    {
+        uint8_t opd = (pixel->dmg_palette) ? io_memory_read(OBP1) : io_memory_read(OBP0);
+        uint8_t cid = (opd >> (2 * pixel->color_id)) & LOWER_2_MASK;
+        return get_dmg_shade(cid);
     }
 }
 
-static void load_obj(uint8_t ly)
-{ // Assume OAM Scan has been completed.
-    uint8_t        lx = 0;
-    GbcPixel *current = dequeue(obj_scan);
-    bool      stacked = (bool) (memory[LCDC] & BIT_2_MASK); 
-    while(lx < GBC_WIDTH)
+static uint32_t draw_bgw_pixel(GbcPixel *pixel)
+{
+    if(is_gbc())
     {
-        if (current == NULL)
+        uint8_t lsb = read_cram(false, pixel->gbc_palette, pixel->color_id, 0);
+        uint8_t msb = read_cram(false, pixel->gbc_palette, pixel->color_id, 1);
+        return get_argb(lsb, msb); 
+    }
+    else
+    {
+        uint8_t bpd = io_memory_read(BGP);
+        uint8_t cid = (bpd >> (2 * pixel->color_id)) & LOWER_2_MASK;
+        return get_dmg_shade(cid);
+    }
+}
+
+static void draw_pixel_lcd(PpuState *ppu)
+{  
+    if (!(lcdc & BIT_7_MASK))
+    { // Black screen!
+        dequeue(obj_pix_fifo);
+        dequeue(bgw_pix_fifo);
+        lcd[lx + (GBC_WIDTH * ly)] = BLACK;
+        advance_renderer();
+        return;
+    }
+
+    if (!win_rendering && drawing_window(lx, ly, lcdc))
+    { // Start rendering window.
+        win_rendering = true;
+        reset_bgw_fetcher();
+        reset_queue(bgw_pix_fifo);
+        return;
+    }
+
+    uint32_t color;
+    if (!is_empty(obj_pix_fifo) && !is_empty(bgw_pix_fifo))
+    {
+        GbcPixel  *obj = dequeue(obj_pix_fifo);
+        GbcPixel  *bgw = dequeue(bgw_pix_fifo);
+        color          = drawing_obj(obj, bgw, lcdc) ? draw_obj_pixel(obj) : draw_bgw_pixel(bgw);
+        lcd[lx + (GBC_WIDTH * ly)] = color;
+        advance_renderer();
+        return;
+    }
+    
+    if(!is_empty(bgw_pix_fifo))
+    {
+        GbcPixel  *bgw = dequeue(bgw_pix_fifo);
+        color          = draw_bgw_pixel(bgw);
+        lcd[lx + (GBC_WIDTH * ly)] = color;
+        advance_renderer();
+        return;
+    }
+}
+
+/* ================== VRAM ACCESS ================== */
+
+/* VRAM ACCESS      | -------> OBTAINING TILE DATA   */
+
+static uint16_t bgw_tile_data_address(PpuState *ppu, uint8_t row)
+{
+    uint16_t address;
+    if (((*ppu->lcdc) & BIT_4_MASK) != 0)
+    { // $8000 Unsigned Method
+        uint8_t tile_index = (uint8_t) bgw_fetcher->tile;
+        address = B0_ADDRESS_START + (16 * tile_index) + (2 * row);
+
+    }
+    else
+    { // $9000 Signed Method
+        int8_t tile_index = (int8_t) bgw_fetcher->tile;
+        address = B2_ADDRESS_START + (16 * tile_index) + (2 * row);
+    }
+    return address;
+}
+
+static void get_win_tile(PpuState *ppu, PixelFetcher *bgw)
+{
+    uint8_t    tile_x = (ppu->lx - ((*ppu->wx) - 7)) / TILE_SIZE;
+    uint8_t    tile_y = ((*ppu->ly) - (*ppu->wy)) / TILE_SIZE;
+    uint16_t     base = ((*ppu->lcdc) & BIT_6_MASK) ? TM1_ADDRESS_START : TM0_ADDRESS_START;
+    uint16_t  address = base + (tile_y * GRID_SIZE) + tile_x;
+    bgw_fetcher->tile = read_vram(TILE_MAP_BANK_0, address);
+    if (is_gbc()) bgw_fetcher->attr = read_vram(TILE_MAP_BANK_1, address);
+}
+
+static void get_win_tile_data(PpuState *ppu)
+{
+    uint8_t       wy = io_memory_read(WY);
+    uint8_t      row = (ly - wy) % TILE_SIZE;
+    uint8_t     bank = TILE_MAP_BANK_0;
+
+    if (is_gbc())
+    {
+        bank = (bgw_fetcher->attr & BIT_3_MASK) >> 3;
+        row  = (bgw_fetcher->attr & BIT_6_MASK) ? (TILE_SIZE - 1 - row) : row; 
+    }
+
+    uint16_t address = bgw_tile_data_address(lcdc, row);
+    bgw_fetcher->lsb = read_vram(bank, address);
+    bgw_fetcher->msb = read_vram(bank, address + 1);
+}
+
+static void get_bg_tile(PpuState *ppu)
+{
+    uint8_t       scx = io_memory_read(SCX);
+    uint8_t       scy = io_memory_read(SCY);
+    uint8_t    tile_x = ((scx + (bgw_fetcher->x * TILE_SIZE)) / TILE_SIZE) & LOWER_5_MASK;
+    uint8_t    tile_y = ((ly + scy) / TILE_SIZE) % GRID_SIZE;
+    uint16_t     base = (lcdc & BIT_3_MASK) ? TM1_ADDRESS_START : TM0_ADDRESS_START;
+    uint16_t  address = base + (tile_y * GRID_SIZE) + tile_x;
+    bgw_fetcher->tile = read_vram(TILE_MAP_BANK_0, address);
+    if (is_gbc()) bgw_fetcher->attr = read_vram(TILE_MAP_BANK_1, address);
+}
+
+static void get_bg_tile_data(PpuState *ppu)
+{
+    uint8_t     scy  = io_memory_read(SCY);
+    uint8_t     row  = (ly + scy) % TILE_SIZE;
+    uint8_t     bank = TILE_MAP_BANK_0; 
+
+    if (is_gbc())
+    {
+        bank = (bgw_fetcher->attr & BIT_3_MASK) >> 3;
+        row  = (bgw_fetcher->attr & BIT_6_MASK) ? (TILE_SIZE - 1 - row) : row; 
+    }
+
+    uint16_t address = get_tile_data_address(lcdc, row);
+    bgw_fetcher->lsb = read_vram(bank, address);
+    bgw_fetcher->msb = read_vram(bank, address + 1);
+}
+
+/* VRAM ACCESS      | -------> OAM SCAN             */
+
+static void oam_scan(Queue *oam_fifo, uint8_t ly)
+{
+    reset_queue(oam_fifo);
+    uint16_t curr_address = OAM_ADDRESS_START;
+    uint8_t lcdc = (*ppu->lcd);
+    bool stacked = (lcdc & BIT_2_MASK) != 0;
+
+    while(curr_address <= OAM_ADDRESS_END)
+    { // TODO: oam_read()?
+        uint8_t      y_pos = read_memory(curr_address) - 16;
+        bool   on_scanline = (ly - y_pos) < (TILE_SIZE + (stacked * TILE_SIZE));
+        if (on_scanline)
         {
-            empty_pixel(lx, ly);
-            enqueue(obj_fifo, pixel_schema);
+            GbcPixel *object     = pixel_schema; // Readability
+            uint8_t x_pos        = read_memory(curr_address + 1);
+            uint8_t tile_index   = read_memory(curr_address + 2);
+            uint8_t attributes   = read_memory(curr_address + 3);
+            object->x            = x_pos;
+            object->y            = y_pos;
+            object->tile_index   = tile_index;
+            object->obj_priority = attributes & BIT_7_MASK;
+            object->y_flip       = attributes & BIT_6_MASK;
+            object->x_flip       = attributes & BIT_5_MASK;
+            object->dmg_palette  = attributes & BIT_4_MASK;
+            object->bank         = attributes & BIT_3_MASK;
+            object->gbc_palette  = (uint8_t) (attributes & LOWER_3_MASK);
+            enqueue(oam_fifo, object);
         }
-        else if (lx < current->x_obj)
+        curr_address += OAM_ENTRY_SIZE;
+    }
+}
+
+/* ================== FETCHER    ================== */
+/* FETCHER          | -------> LOCAL HELP           */
+/* FETCHER          | -------> BACKGROUND           */
+
+static bool push_bgw_row()
+{
+    if (bgw_pix_fifo->size) return false; // Only push if queue is empty.
+
+    uint8_t start = 0;
+    if (bgw_fetcher->x != 0)
+    {
+        start = (*ppu->scx) % TILE_SIZE;
+    }
+
+    for (int i = 0; i < TILE_SIZE; i++)
+    { 
+        bool x_flip = is_gbc() && (bgw_fetcher->attr & BIT_5_MASK);
+        uint8_t lsb, msb;
+        if (!x_flip)
         {
-            empty_pixel(lx, ly);
-            enqueue(obj_fifo, pixel_schema);
+            lsb = (bgw_fetcher->lsb & BIT_7_MASK) >> 7;
+            bgw_fetcher->lsb <<= 1;
+            msb = (bgw_fetcher->msb & BIT_7_MASK) >> 7;
+            bgw_fetcher->msb <<= 1;
         }
-        else if 
-        (
-            lx >= current->x_obj && 
-            lx < (current->x_obj + TILE_SIZE + (TILE_SIZE * stacked))
-        )
-        {
-            // Logic to enqueue object pixel based on lx, ly, x-flip, y-flip, and obj_size.
-            uint8_t pix_x = lx - current->x_obj;
-            uint8_t pix_y = ly - current->y_obj;
-            if (current->y_flip) pix_y = ((stacked * TILE_SIZE) + (TILE_SIZE - 1)) - pix_y;
-            if (current->x_flip) pix_x = (TILE_SIZE - 1) - pix_x;
-            // Use $8000U addressing
-            uint8_t       tli = B0_ADDRESS_START + (current->tile_index * TILE_SIZE * 2) + (2 * pix_y);
-            uint8_t  line_lsb = *read_vram(current->bank, tli);
-            uint8_t  line_msb = *read_vram(current->bank, tli + 1);
-            bool    color_lsb = (bool) (line_lsb | (BIT_7_MASK >> pix_x));
-            bool    color_msb = (bool) (line_msb | (BIT_7_MASK >> pix_x));
-            uint8_t     color = (color_msb << 1) | (color_lsb);
-            pixel_schema->color_id = color;
-            pixel_schema->  x_draw = lx;
-            pixel_schema->  y_draw = ly;   
-            enqueue(obj_fifo, pixel_schema);
-        }   
         else
         {
-            current = dequeue(obj_scan);
-            continue;
+            lsb = bgw_fetcher->lsb & BIT_0_MASK;
+            bgw_fetcher->lsb >>= 1;
+            msb = bgw_fetcher->msb & BIT_0_MASK;
+            bgw_fetcher->msb >>= 1;
         }
-        lx += 1;
+        
+        if (i < start) continue; // Skip SCX % 8
+
+        uint8_t      color = (msb << 1) | lsb;
+        GbcPixel    *pixel = pixel_schema; // Alias for readability
+        pixel->   color_id = color;
+        pixel->bg_priority = is_gbc() ? (bgw_fetcher->attr & BIT_7_MASK) : 0;
+        pixel->gbc_palette = is_gbc() ? (bgw_fetcher->attr & LOWER_3_MASK) : 0;
+        enqueue(bgw_pix_fifo, pixel);
+    } 
+    return true;
+}
+
+static void next_bgw_step()
+{
+    switch (bgw_fetcher->step)
+    {  
+        case GET_TILE: bgw_fetcher->step =  GET_TDL; break;
+        case  GET_TDL: bgw_fetcher->step =  GET_TDH; break;
+        case  GET_TDH: bgw_fetcher->step =    SLEEP; break;
+        case    SLEEP: bgw_fetcher->step =     PUSH; break;
+        case     PUSH: bgw_fetcher->step = GET_TILE; break;
     }
 }
 
-static void scanline(uint8_t ly)
+static void bgw_fetcher_step(PpuState *ppu)
 {
-    load_bgw(ly);
-    load_obj(ly);
-}
-
-static void draw_gbc(const GbcPixel *pixel, bool is_obj)
-{
-    const uint8_t *color_palette = read_cram(is_obj, pixel->gbc_palette, pixel->color_id);
-    uint8_t            lsb = color_palette[0];
-    uint8_t            msb = color_palette[1];
-    uint32_t        color  = get_argb(lsb, msb);
-    lcd[pixel->x_draw + (GBC_WIDTH * pixel->y_draw)] = color;  
-}
-
-static void merge_fifos_gbc()
-{
-    while (!is_empty(bgw_fifo))
+    bgw_fetcher->duration += 1;
+    switch(bgw_fetcher->step)
     {
-        GbcPixel *bgw = dequeue(bgw_fifo);
-        GbcPixel *obj = dequeue(obj_fifo);
+        case GET_TILE:
 
-        if (!(memory[LCDC] & BIT_0_MASK) || obj->color_id == 0)
+            if (bgw_fetcher->duration >= 2)
+            {
+                win_rendering ? 
+                get_win_tile(lx, ly, lcdc) : get_bg_tile(ly, lcdc);
+                next_bgw_step();
+            }
+
+        break;
+
+        case GET_TDL:
+            
+            if (bgw_fetcher->duration >= 4)
+            {
+                win_rendering ?
+                get_win_tile_data(lx, ly, lcdc) : get_bg_tile_data(ly, lcdc);
+                next_bgw_step();
+            }
+
+        break;
+
+        case GET_TDH:
+
+            if (bgw_fetcher->duration >= 6)
+            {
+                bgw_fetcher->row_pushed = push_bgw_row(lx, ly);
+                next_bgw_step();
+            }
+
+        break;
+        
+        case SLEEP:
+
+            if (bgw_fetcher->duration >= 8)
+            {
+                next_bgw_step();
+            }
+            
+        break;
+
+        case PUSH:
+
+            if (!bgw_fetcher->row_pushed)
+            {
+                bgw_fetcher->row_pushed = push_bgw_row(lx, ly);
+            }
+            
+            if (bgw_fetcher->row_pushed)
+            {
+                reset_bgw_fetcher();
+                fetcher_x += 1;
+            }
+        
+        break;
+    }
+}
+
+/* FETCHER          | -------> SPRITES              */
+
+static bool push_obj_row()
+{ // Assume that pixel has been padded, merge here.
+    GbcPixel *target_obj = dequeue(oam_buff);
+    for (int i = 0; i < TILE_SIZE; i++)
+    { 
+        uint8_t lsb, msb;
+        if (target_obj->x_flip)
         {
-            draw_gbc(bgw, false);
-        }
-        else if (!bgw->color_id)
-        {  
-            draw_gbc(obj, true);
-        }
-        else if (!obj->obj_priority)
-        {
-            draw_gbc(obj, true);
+                         lsb = (obj_fetcher->lsb & BIT_7_MASK) >> 7;
+            obj_fetcher->lsb = obj_fetcher->lsb << 1;
+                         msb = (obj_fetcher->msb & BIT_7_MASK) >> 7;
+            obj_fetcher->msb = obj_fetcher->msb << 1;
         }
         else
         {
-            draw_gbc(bgw, false);
+                         lsb = obj_fetcher->lsb & BIT_0_MASK;
+            obj_fetcher->lsb = obj_fetcher->lsb >> 1;
+                         msb = obj_fetcher->msb & BIT_0_MASK;
+            obj_fetcher->msb = obj_fetcher->msb >> 1;
         }
-    }  
+        uint8_t         color = (msb << 1) | lsb;
+        target_obj-> color_id = color; // encode current pixels id. 
+        GbcPixel *current_obj = dequeue(obj_pix_fifo);
+        enqueue(obj_pix_fifo, get_higher_prio_obj(target_obj, current_obj));
+    }
+    return true;
 }
 
-static void draw_bgw_dmg(GbcPixel *pixel)
+static GbcPixel *get_higher_prio_obj(GbcPixel *obj1, GbcPixel *obj2)
 {
-    uint8_t   bgp = memory[BGP];
-    uint8_t color = (bgp >> (2 * pixel->color_id)) & LOWER_2_MASK;
-    uint8_t     x = pixel->x_draw;
-    uint8_t     y = pixel->y_draw;
-    switch (color)
+    if (obj1->color_id != 0) return obj2;
+    if (obj2->color_id != 0) return obj1;
+    if (is_gbc()) // CGB
     {
-        case 0: 
-            lcd[x + (GBC_WIDTH * y)] = WHITE;
-            break; 
-        case 1: 
-            lcd[x + (GBC_WIDTH * y)] = LIGHT_GRAY;
-            break;
-        case 2: 
-            lcd[x + (GBC_WIDTH * y)] = DARK_GRAY;
-            break;
-        case 3: 
-            lcd[x + (GBC_WIDTH * y)] = BLACK;
-            break;
-        default:
-            lcd[x + (GBC_WIDTH * y)] = BLACK;
-            break;
+        if (obj1->oam_address <= obj2->oam_address) // Lower OAM address wins.
+        {
+            return obj1;
+        }
+        return obj2;
+    }
+    else          // DMG
+    {
+        if (obj1->x <= obj2->x)                     // Smaller x wins.
+        {
+            return obj1;
+        }
+        return obj2;
     }
 }
 
-static void draw_obj_dmg(GbcPixel *pixel)
-{ // Differentiate (OBP0 - OBP1) via dmg_palette attribute.
-    uint8_t obp =
-    pixel->dmg_palette ? 
-    (memory[OBP0]): 
-    (memory[OBP1]);
-    uint8_t color = obp >> (2 * pixel->color_id);
-    uint8_t     x = pixel->x_draw;
-    uint8_t     y = pixel->y_draw;
-    switch (color)
+static void next_obj_step()
+{
+    switch(obj_fetcher->step)
     {
-        case 0: 
-            lcd[x + (GBC_WIDTH * y)] = WHITE;
-            break; 
-        case 1: 
-            lcd[x + (GBC_WIDTH * y)] = LIGHT_GRAY;
-            break;
-        case 2: 
-            lcd[x + (GBC_WIDTH * y)] = DARK_GRAY;
-            break;
-        case 3: 
-            lcd[x + (GBC_WIDTH * y)] = BLACK;
-            break;
+        case      GET_TDL: obj_fetcher->step =      GET_TDH; break;
+        case      GET_TDH: obj_fetcher->step = PAD_OAM_FIFO; break;
+        case PAD_OAM_FIFO: obj_fetcher->step =         PUSH; break;
+        case         PUSH: obj_fetcher->step =      GET_TDL; break;
     }
 }
 
-static void merge_fifos_dmg()
+static void pad_fifo(Queue *fifo)
 {
-    while (!is_empty(bgw_fifo))
+    GbcPixel *pixel = empty_pixel();
+    while(fifo->size != TILE_SIZE)
     {
-        GbcPixel *bgw = dequeue(bgw_fifo);
-        GbcPixel *obj = dequeue(obj_fifo);
-        if (!obj->color_id)
-        {
-            draw_bgw_dmg(bgw);
-        }
-        else if (obj->obj_priority && bgw->color_id != 0)
-        {
-            draw_bgw_dmg(bgw);
-        }
-        else
-        {
-            draw_obj_dmg(obj);
-        }
+        enqueue(fifo, pixel);
+    } 
+}
+
+static void get_obj_tile_data(GbcPixel *obj, PpuState *ppu)
+{
+
+}
+
+static void obj_fetcher_step(PpuState *ppu)
+{
+    obj_fetcher->duration += 1;
+    switch(obj_fetcher->step)
+    {
+        case GET_TDL: 
+
+            if (obj_fetcher->duration >= 2)
+            {
+                next_obj_step();
+            }
+
+        break;
+
+        case GET_TDH:
+
+            if (obj_fetcher->duration >= 4)
+            {
+                GbcPixel *obj = peek(oam_fifo);
+                get_obj_tile_data(obj, ppu);
+                next_obj_step();
+            }
+        
+        break;
+        
+        case PAD_OAM_FIFO: 
+
+            if (obj_fetcher->duration >= 5)
+            {
+                pad_obj_fifo();
+                next_obj_step();
+            }   
+        
+        break;
+        
+        case PUSH: 
+
+            if (!obj_fetcher->row_pushed)
+            {
+                obj_fetcher->row_pushed = push_obj_row();
+            }
+            if (obj_fetcher->row_pushed) reset_obj_fetcher();
+        
+        break;
     }
 }
 
-static void render_scanline(uint8_t ly)
+/* FETCHER         | -------> DRIVER               */
+
+static void pixel_pipeline_step(PpuState *ppu)
 {
-    oam_scan(ly);
-    scanline(ly);
-    is_gbc() ? merge_fifos_gbc() : merge_fifos_dmg();
+   
+
+}
+
+static void prep_scanline_render(PpuState *ppu)
+{   
+    // Normalize PPU State
+    reset_ppu(ppu);
+    // Empty FIFOs
+    reset_queue(obj_pix_fifo);
+    reset_queue(bgw_pix_fifo);
+    // Reset Fetchers
+    reset_fetcher(bgw_fetcher);
+    reset_fetcher(obj_fetcher);
+}
+
+/* ================== PUBLIC API ================= */
+
+static void set_ppu_mode(PpuMode mode)
+{
+    (*ppu->stat) = ((*ppu->stat) & ~LOWER_2_MASK) | mode;
+}
+
+void dot(uint32_t current_dot)
+{
+    uint16_t sc_dot = current_dot % DOTS_PER_LINE;
+    uint8_t      ly = (uint8_t) (current_dot / DOTS_PER_LINE);
+    uint8_t    lcdc = (*ppu->lcdc);
+    uint8_t    stat = (*ppu->stat);
+
+    (*ppu->ly) = ly; // Recording scanline position.
+
+    if ((ly < GBC_HEIGHT) && (sc_dot == 0))
+    {
+        set_ppu_mode(OAM_SCAN);
+        oam_scan(oam_fifo, ly);
+        bool triggered = (stat & BIT_5_MASK) != 0;
+        if (triggered) request_interrupt(LCD_STAT_INTERRUPT_CODE);
+    }
+    else if ((ly < GBC_HEIGHT) && (sc_dot == 80))
+    {
+        set_ppu_mode(DRAWING);
+        prep_scanline_render(ppu);
+    }
+    else if ((ly < GBC_HEIGHT) && (sc_dot == 369))
+    {
+        set_ppu_mode(HBLANK);
+        bool triggered = (stat & BIT_4_MASK) != 0;
+        if (triggered) request_interrupt(LCD_STAT_INTERRUPT_CODE);
+    }
+    else if ((ly == GBC_HEIGHT) && (sc_dot == 0))
+    {
+        set_ppu_mode(VBLANK);
+        bool triggered = (stat & BIT_4_MASK) != 0;
+        if (triggered) request_interrupt(LCD_STAT_INTERRUPT_CODE);
+        request_interrupt(VBLANK_INTERRUPT_CODE); // Happens once per frame, regardless.
+    }
+
+    bool drawing = ((stat & LOWER_2_MASK) == DRAWING) && (!ppu->sc_complete);
+    if (drawing) pixel_pipeline_step(ppu);
+
+    uint8_t lyc = (*ppu->lyc);
+    bool triggered = (ly == lyc) && (stat & BIT_6_MASK);
+    if (triggered) request_interrupt(LCD_STAT_INTERRUPT_CODE);
 }
 
 void *render_frame()
 {   
-    uint8_t ly = 0;
-    while (ly < GBC_HEIGHT && (memory[LCDC] & BIT_7_MASK))
-    {
-        render_scanline(ly);
-        ly += 1;
-    }
-    return lcd;
+    return ppu->lcd;
 }
 
-// Emulation interface for graphics.
-void dot(uint32_t current_dot)
+bool init_graphics()
 {
-    uint16_t dot_sc = current_dot % DOTS_PER_LINE;
-    uint8_t      ly = (uint8_t) (current_dot / DOTS_PER_LINE);
-    uint8_t     lyc = (uint8_t) memory[LYC];
-    uint8_t    stat = (uint8_t) memory[STAT];
-    if (ly < GBC_HEIGHT && dot_sc == 0)
-    { // OAM Start
-        stat = (stat & ~LOWER_2_MASK) | OAM_SCAN;
-        if (stat & BIT_5_MASK) request_interrupt(LCD_STAT_INTERRUPT_CODE);
-    }
-    else if (ly < GBC_HEIGHT && dot_sc == 80)
-    { // Drawing Start
-        stat = (stat & ~LOWER_2_MASK) | DRAWING;
-    }
-    else if (dot_sc == 369)
-    { // HBlank Start
-        stat = (stat & ~LOWER_2_MASK) | HBLANK;
-        if (stat & BIT_3_MASK) request_interrupt(LCD_STAT_INTERRUPT_CODE);
-    }
-    else if (ly == GBC_HEIGHT && dot_sc == 0)
-    { // VBlank Start
-        request_interrupt(VBLANK_INTERRUPT_CODE);
-        stat = (stat & ~LOWER_2_MASK) | VBLANK;
-        if (stat & BIT_4_MASK) request_interrupt(LCD_STAT_INTERRUPT_CODE); 
-    }
-    bool lyc_triggered = (ly == lyc);
-    stat = ((uint8_t) (stat & ~BIT_2_MASK)) | ((uint8_t) (lyc_triggered << 2));
-    if (lyc_triggered && (stat & BIT_6_MASK)) request_interrupt(LCD_STAT_INTERRUPT_CODE);
-    memory[LY]   = ly;
-    memory[STAT] = stat;
+    ppu           = (PpuState*) malloc(sizeof(PpuState));
+    ppu->lcd      = (uint32_t*) malloc(GBC_WIDTH * GBC_HEIGHT * sizeof(uint32_t));
+    reset_ppu(ppu); init_registers(ppu);
+
+    bgw_fetcher   = (PixelFetcher*) malloc(sizeof(PixelFetcher));
+    reset_fetcher(bgw_fetcher); bgw_fetcher->handler = bgw_fetcher_step;
+    obj_fetcher   = (PixelFetcher*) malloc(sizeof(PixelFetcher));
+    reset_fetcher(obj_fetcher); obj_fetcher->handler = obj_fetcher_step;
+
+    pixel_schema  = (GbcPixel*)     malloc(    sizeof(GbcPixel));
+    bgw_pix_fifo  = init_queue(16);
+    obj_pix_fifo  = init_queue(8);
+    oam_fifo      = init_queue(10);
 }
+
+void tidy_graphics()
+{
+    free(ppu);                   ppu = NULL;
+    free(bgw_fetcher);   bgw_fetcher = NULL;
+    free(obj_fetcher);   obj_fetcher = NULL;
+    free(ppu->lcd);         ppu->lcd = NULL;
+    free(pixel_schema); pixel_schema = NULL;
+
+    tidy_queue(bgw_pix_fifo);
+    tidy_queue(obj_pix_fifo);
+    tidy_queue(oam_fifo);
+}
+

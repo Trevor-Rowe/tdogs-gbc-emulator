@@ -1,5 +1,5 @@
-#ifndef GBC_LOGGER_H
-#define GBC_LOGGER_H
+#ifndef LOGGER_H
+#define LOGGER_H
 
 typedef enum
 {
@@ -11,10 +11,6 @@ typedef enum
 
 } LoggingLevel;
 
-void init_logger(bool log_file_enabled);
-
-bool toggle_master();
-
 void log_message
 (
     LoggingLevel level, 
@@ -23,5 +19,9 @@ void log_message
     const char *format,
     ...
 );
+
+void cpu_log(LoggingLevel level, const char *message, ...);
+
+void joypad_log(LoggingLevel level, const char *message, ...);
 
 #endif

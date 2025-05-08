@@ -5,7 +5,7 @@
 #include "memory.h"
 #include "emulator.h"
 #include "common.h"
-#include "gbc_logger.h"
+#include "logger.h"
 
 #define BASE_ROM_DIR = "../roms/testing"
 #define FIRST_ROM    = "../roms/testing/first_rom.gb"

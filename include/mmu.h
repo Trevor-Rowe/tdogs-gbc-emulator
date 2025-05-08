@@ -1,7 +1,6 @@
-#ifndef MEMORY_H
-#define MEMORY_H
+#ifndef MMU_H
+#define MMU_H
 #include <stdint.h>
-#include <stdbool.h>
 
 typedef enum
 {
@@ -40,7 +39,7 @@ typedef enum
     TIMA     = (uint16_t) 0xFF05, // Timer counter
     TMA      = (uint16_t) 0xFF06, // Timer modulo
     TAC      = (uint16_t) 0xFF07, // Timer control
-    IF       = (uint16_t) 0xFF0F, // Interrupt flag
+    IFR      = (uint16_t) 0xFF0F, // Interrupt flag
     NR10     = (uint16_t) 0xFF10, // Sound channel 1 sweep
     NR11     = (uint16_t) 0xFF11, // Sound channel 1 length and duty cycle 
     NR12     = (uint16_t) 0xFF12, // Sound channel 1 volume and envelope
@@ -93,7 +92,7 @@ typedef enum
     SVBK     = (uint16_t) 0xFF70, // WRAM bank                                (CGB)
     PCM12    = (uint16_t) 0xFF76, // Audio digital outputs 1 & 2              (CGB)
     PCM34    = (uint16_t) 0xFF77, // Audio digital outputs 3 & 4              (CGB)
-    IE       = (uint16_t) 0xFFFF, // Interrupt enable                         
+    IER      = (uint16_t) 0xFFFF, // Interrupt enable                         
 
 } HardwareRegisters;
 
@@ -105,68 +104,34 @@ typedef enum
     SERIAL_VECTOR = (uint16_t) 0x0058,
     JOYPAD_VECTOR = (uint16_t) 0x0060
     
-} InterruptVectors;
+} InterruptVector;
 
-/* CALL FIRST */
-void init_memory(uint16_t address);
+void init_memory();
 
-/* CALL LAST */
 void tidy_memory();
 
-/*
-    Reads from memory.
-    @param address: 16-Bit Address to read from.
-    @return: Pointer to 8-Bit value located at given address.
-*/
-uint8_t *read_memory(uint16_t address);
+uint8_t read_memory(uint16_t address);
 
-/*
-    Handles write logic to memory, with focus on emulation accuracy.
-    @param address: 16-Bit Address to write to.
-    @param   value: value to write into the address.
-*/
 void write_memory(uint16_t address, uint8_t value);
 
-
-/*
-    Emulation interface for MMU.
-*/
 void check_dma();
 
-/*
-    Check to see if a CPU blocking DMA is active.
-*/
 bool dma_active();
 
-/*
-    Read directly from VRAM, useful for PPU.
-    @param    bank: 0 - 1 VRAM bank selection. This is done bia the VBK register for normal reads/writes in CGB mode.
-    @param address: memory address, which is then adjusted due to it being in a different memory block.
-*/
-uint8_t *read_vram(uint8_t bank, uint16_t address);
+uint8_t read_joypad();
 
+uint8_t read_vram(uint8_t bank, uint16_t address);
 
-/*
-    Read directoy from CRAM, useful for PPU.
-    @param        is_obj: Accessing object's CRAM or background's CRAM?
-    @param palette_index: 3-Bit (0-7) palette selection index.
-    @param      color_id: 2-Bit (0-3) color selection index.
-    @return: Starting address of selected color. 
-*/
-uint8_t *read_cram(bool is_obj, uint8_t palette_index, uint8_t color_id);
+uint8_t read_cram(bool is_obj, uint8_t palette_index, uint8_t color_id, uint8_t index);
 
-/*
-    Obtain primary memory pointer, useful for PPU.
-    CAREFUL with this, attempting to write/write to VRAM or WRAM will not work.
-*/
 uint8_t *get_memory();
 
-/*
-    Debug purposes, obtains a visual of VRAM memory.
-    @param start: Starting address.
-    @param   end: Ending address.
-    @param  bank: Which bank to look into.
-*/
+uint8_t *get_memory_pointer(uint16_t address);
+
 void print_vram(uint16_t start, uint16_t end, bool bank);
+
+uint8_t io_memory_read(uint16_t address);
+
+void io_memory_write(uint16_t address, uint8_t value);
 
 #endif

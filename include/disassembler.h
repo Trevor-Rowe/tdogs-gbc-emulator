@@ -1,7 +1,7 @@
 #ifndef DISASSEMBLER_H
 #define DISASSEMBLER_H
 
-const char* opcode_word[256] = {
+char* opcode_word[256] = {
     /* 0x00 - 0x0F */
     "NOP", "LD BC, NN", "LD [BC], A", "INC BC", "INC B", "DEC B", "LD B, N", "RLCA",
     "LD [NN], SP", "ADD HL, BC", "LD A, [BC]", "DEC BC", "INC C", "DEC C", "LD C, N", "RRCA",
@@ -49,12 +49,12 @@ const char* opcode_word[256] = {
     "ADD SP, N", "JP [HL]", "LD [a16], A", "INVALID", "INVALID", "INVALID", "XOR d8", "RST 28H",
     /* 0xF0 - 0xFF */
     "LDH A, [FF00 + N]", "POP AF", "LDH A, [C]", "DI", "INVALID", "PUSH AF", "OR N", "RST 30H",
-    "LD HL, SP + N", "LD SP, HL", "LD A, [NN]", "EI", "INVALID", "INVALID", "CP N", "RST 38H"
+    "LD HL, SP + N", "LD SP, HL", "LD A, [NN]", "EI", "INTERRUPT EXECUTION", "PC PING", "CP N", "RST 38H"
 };
 
 #include <stdio.h>
 
-const char* cb_opcode_word[256] = {
+char* cb_opcode_word[256] = {
     /* 0xCB00 - 0xCB0F */
     "RLC B", "RLC C", "RLC D", "RLC E", "RLC H", "RLC L", "RLC [HL]", "RLC A",
     "RRC B", "RRC C", "RRC D", "RRC E", "RRC H", "RRC L", "RRC [HL]", "RRC A",

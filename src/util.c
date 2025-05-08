@@ -1,5 +1,10 @@
 #include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "logger.h"
 #include "util.h"
+
+#define LOG_MESSAGE(level, format, ...) log_message(level, __FILE__, __func__, format, ##__VA_ARGS__)
 
 /* CIRCULAR QUEUE IMPLEMENTATION FOR PIXEL FETCHER */
 
@@ -48,10 +53,8 @@ void enqueue(Queue *queue, GbcPixel *value)
     temp-> oam_address = value->oam_address;
     temp->    color_id = value->color_id;
     temp-> gbc_palette = value->gbc_palette;
-    temp->       x_obj = value->x_obj;
-    temp->       y_obj = value->y_obj;
-    temp->      x_draw = value->x_draw;
-    temp->      y_draw = value->y_draw;
+    temp->           x = value->x;
+    temp->           y = value->y;
     temp->  tile_index = value->tile_index;
     temp-> dmg_palette = value->dmg_palette;
     temp->        bank = value->bank;
@@ -70,6 +73,11 @@ void reset_queue(Queue *queue)
     queue->size     =  0; 
 }
 
+GbcPixel *peek(Queue *queue)
+{
+    return queue->items[0];
+}
+
 GbcPixel *dequeue(Queue *queue)
 {
     if (is_empty(queue)) return NULL;
@@ -86,8 +94,8 @@ void sort_oam_by_xpos(Queue *objs)
     while(index < objs->size)
     {
         if (index == 0) index = 1;
-        uint8_t x_prev = (objs->items[index - 1])->x_obj;
-        uint8_t x_curr = (objs->items[index])->x_obj;
+        uint8_t x_prev = (objs->items[index - 1])->x;
+        uint8_t x_curr = (objs->items[index])->x;
         if (x_prev > x_curr)
         {
             GbcPixel *obj_prev = objs->items[index - 1]; 
@@ -105,4 +113,14 @@ void sort_oam_by_xpos(Queue *objs)
 uint8_t queue_size(Queue *queue)
 {
     return queue->size;
+}
+
+void print_queue(Queue *queue)
+{
+    for (int i = 0; i < queue->size; i++)
+    {
+        GbcPixel **items = queue->items;
+        LOG_MESSAGE(TEST, "%d", items[i]->x);
+    }
+    LOG_MESSAGE(TEST, "");
 }

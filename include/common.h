@@ -17,6 +17,7 @@ typedef enum
     LOWER_5_MASK    =  0b00011111, 
     LOWER_6_MASK    =  0b00111111,
     LOWER_12_MASK   =      0x0FFF,
+    LOWER_14_MASK   =      0x3FFF,
     LOWER_BYTE_MASK =      0x00FF,
     UPPER_BYTE_MASK =      0xFF00,
 

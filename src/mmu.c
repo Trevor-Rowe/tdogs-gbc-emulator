@@ -1,12 +1,18 @@
 #include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include "common.h"
+#include "emulator.h"
 #include "mmu.h"
-#include "ppu.h"
+#include "cpu.h"
 #include "logger.h"
 #include "cart.h"
+#include "timer.h"
 
 #define LOG_MESSAGE(level, format, ...) log_message(level, __FILE__, __func__, format, ##__VA_ARGS__)
 
+#define MEMORY_SIZE       0x10000
 #define CRAM_BANK_SIZE        128
 #define ECHO_RAM_OFFSET    0x2000
 #define DMA_DURATION          160
@@ -33,15 +39,78 @@ typedef struct
 
 } HDMATransfer;
 
-static HDMATransfer       *hdma;
-static DMATransfer         *dma;
-static uint8_t          *memory;
-static uint8_t            *cram;
-static uint8_t           **vram;
-static uint8_t           **wram;
-static bool         bios_locked;   
+static HDMATransfer *hdma;
+static DMATransfer   *dma;
+static uint8_t    *memory;
+static uint8_t      *cram;
+static uint8_t     **vram;
+static uint8_t     **wram;
+static bool   bios_locked; 
 
-/* DMA-Related Functionality */
+void init_memory()
+{
+    // (65,536 Bytes) General Memory with some 'extra' room for lazy addressing.
+    memory = (uint8_t*)  malloc(MEMORY_SIZE * sizeof(uint8_t));
+    memset(memory, 0, MEMORY_SIZE); 
+    // Default Values to 0. 
+
+    // (128 Bytes) CRAM Memory 
+    cram = (uint8_t*)  malloc(CRAM_BANK_SIZE * sizeof(uint8_t));
+    // Defaults to random RGB Values.
+
+    // DMA State Handlers
+    dma  = (DMATransfer*)  malloc(sizeof(DMATransfer));
+    hdma = (HDMATransfer*) malloc(sizeof(HDMATransfer));
+
+    // (2 Banks ~8 KB) VRAM 
+    vram    = (uint8_t**) malloc(VRAM_BANK_QUANTITY * sizeof(uint8_t*));
+    vram[0] = (uint8_t*)  malloc(VRAM_BANK_SIZE     * sizeof(uint8_t));
+    memset(vram[0], 0, VRAM_BANK_SIZE);
+    vram[1] = (uint8_t*)  malloc(VRAM_BANK_SIZE     * sizeof(uint8_t));
+    memset(vram[1], 0, VRAM_BANK_SIZE);
+    // Defaut Values to 0, restrict access to bank 1 if not in CGB mode.
+
+    // WRAM
+    wram = (uint8_t**) malloc(WRAM_BANK_QUANTITY * sizeof(uint8_t*));
+    for (uint8_t i = 0; i < WRAM_BANK_QUANTITY; i++)
+    { // (Static Bank 0, 7 Banks ~4 KB), (SVBK)
+        wram[i] = (uint8_t*) malloc(WRAM_BANK_SIZE * sizeof(uint8_t));
+        memset(wram[i], 0, WRAM_BANK_SIZE); // Default values to 0.
+    }
+
+    bios_locked = false; // Latches when written.
+}
+
+void tidy_memory()
+{
+    free(memory);
+    memory = NULL;
+
+    free(cram);
+    cram = NULL;
+
+    free(dma);
+    dma = NULL;
+    free(hdma);
+    hdma = NULL;
+
+    free(vram[0]);
+    vram[0] = NULL;
+    free(vram[1]);
+    vram[1] = NULL;
+    free(vram);
+    vram = NULL;
+
+    for (int i = 0; i < WRAM_BANK_QUANTITY; i++)
+    {
+        free(wram[i]);
+        wram[i] = NULL;
+    }
+    free(wram);
+    wram = NULL;
+}
+
+/* DMA METHODOLOGY */
 
 static void start_dma(uint8_t dma_val)
 {
@@ -60,7 +129,7 @@ static void start_hdma(uint8_t hdma5)
     hdma->src_address = (memory[HDMA1] << BYTE) | (memory[HDMA2] & 0xF0); 
     // DST: HDMA3 (High), HDMA4 (Low)
     // Only bits 12 - 4 are considered. 
-    hdma->dst_address = B0_ADDRESS_START | ((memory[HDMA3] & 0x1F) << BYTE) | (memory[HDMA4] & 0xF0);
+    hdma->dst_address = 0x8000 | ((memory[HDMA3] & 0x1F) << BYTE) | (memory[HDMA4] & 0xF0);
     // Determine the length of transfer.
     // L = (R + 1) * $10
     hdma->length      = ((hdma5 & 0x7F) + 1) * 0x10;
@@ -90,19 +159,95 @@ static void start_hdma(uint8_t hdma5)
     // Stopping transfer does not set HDMA1-4 to $FF.
 }
 
-/* IO Register Functionality */
-
-static uint8_t *io_memory_read(uint16_t address)
+void check_dma()
 {
-    if (address == BCPD) return &(cram[memory[BCPS] & LOWER_6_MASK]);
-    if (address == OCPD) return &(cram[(memory[OCPS] & LOWER_6_MASK) + 0x40]);
-    return &(memory[address]); 
+    if(dma->active == 0) return;
+    if(dma->cycles_left > 0)
+    {
+        uint8_t src_val = read_memory(dma->src_address++);
+        write_memory(dma->dst_address++, src_val);
+        dma->cycles_left -= 1;  
+    }
+    if(dma->cycles_left <= 0)
+    {
+        dma->active = false;
+    }
 }
 
-static void io_memory_write(uint16_t address, uint8_t value)
+bool dma_active()
 {
+    return (dma->active);
+}
+
+/* MEMORY ACCESS  */
+
+uint8_t read_joypad()
+{
+    JoypadState *joypad = get_joypad();
+    uint8_t select = memory[JOYP] & 0x30;
+    uint8_t result = select | 0x0F;
+
+    if ((select & BIT_5_MASK) == 0) // Action buttons selected
+    {
+        if (joypad->A)      result &= ~A_BUTTON_MASK;
+        if (joypad->B)      result &= ~B_BUTTON_MASK;
+        if (joypad->SELECT) result &= ~SELECT_BUTTON_MASK;
+        if (joypad->START)  result &= ~START_BUTTON_MASK;
+    }
+
+    if ((select & BIT_4_MASK) == 0) // Direction buttons selected 
+    {
+        if (joypad->RIGHT) result &= ~RIGHT_BUTTON_MASK;
+        if (joypad->LEFT)  result &= ~LEFT_BUTTON_MASK;
+        if (joypad->UP)    result &= ~UP_BUTTON_MASK;
+        if (joypad->DOWN)  result &= ~DOWN_BUTTON_MASK;
+    }
+
+    joypad_log(DEBUG, "|| (%02X):(%02X)", select, result);
+    return result;
+}
+
+
+uint8_t io_memory_read(uint16_t address)
+{
+    if ((address < IO_REGISTERS_START) || (address > IO_REGISTERS_END))
+    {
+        LOG_MESSAGE(ERROR, "Invalid IO read attempt: %04X", address);
+        return 0xFF;
+    }
+    switch (address)
+    {
+        case JOYP: return read_joypad();
+        case BCPD: return cram[(memory[BCPS] & LOWER_6_MASK)];
+        case OCPD: return cram[(memory[OCPS] & LOWER_6_MASK) + 0x40];
+        default:   return memory[address];
+    }
+}
+
+void io_memory_write(uint16_t address, uint8_t value)
+{
+    if ((address < IO_REGISTERS_START) || (address > IO_REGISTERS_END))
+    {
+        LOG_MESSAGE(ERROR, "Invalid IO write attempt: %04X", address);
+        return;
+    }
     switch(address)
     {
+        case JOYP:
+            memory[address] = (value & 0x30);
+            break;
+        case DIV:
+            clear_sys();
+            break;
+        case TIMA:
+            write_tima(value);
+            break;
+        case TAC:
+            write_tac(value);
+            break;
+        case IFR:
+            write_ifr(value);
+            break;
         case DMA:
             start_dma(value);
             break;
@@ -145,7 +290,9 @@ static void io_memory_write(uint16_t address, uint8_t value)
             {
                 uint8_t index = memory[BCPS] & LOWER_6_MASK;
                 cram[index] = value;
-                if(memory[BCPS] & BIT_7_MASK) memory[BCPS] = (memory[BCPS] & BIT_7_MASK) | ((index + 1) & LOWER_6_MASK);
+                uint8_t inc_index = (index + 1) & LOWER_6_MASK;
+                if(memory[BCPS] & BIT_7_MASK) 
+                    memory[BCPS] = (memory[BCPS] & BIT_7_MASK) | (inc_index);
             }
             break;
         case OCPS:
@@ -156,7 +303,9 @@ static void io_memory_write(uint16_t address, uint8_t value)
             {
                 uint8_t index = memory[OCPS] & LOWER_6_MASK;
                 cram[index + 0x40] = value;
-                if(memory[OCPS] & BIT_7_MASK) memory[OCPS] = (memory[OCPS] & BIT_7_MASK) | ((index + 1) & LOWER_6_MASK);
+                uint8_t inc_index = (index + 1) & LOWER_6_MASK;
+                if (memory[OCPS] & BIT_7_MASK)
+                    memory[OCPS] = (memory[OCPS] & BIT_7_MASK) | inc_index;
             }
             break;
         case OPRI:
@@ -177,89 +326,142 @@ static void io_memory_write(uint16_t address, uint8_t value)
     }
 }
 
-/* Header Function Implementations */
-
-void init_memory(uint16_t size)
+uint8_t read_vram(uint8_t bank, uint16_t address)
 {
-    memory      = (uint8_t*)  malloc(size);
-    vram        = (uint8_t**) malloc(VRAM_BANK_QUANTITY * sizeof(uint8_t*));
-    wram        = (uint8_t**) malloc(WRAM_BANK_QUANTITY * sizeof(uint8_t*));
-    cram        = (uint8_t*)  malloc(CRAM_BANK_SIZE);
-    dma         = (DMATransfer*)  malloc(sizeof(DMATransfer));
-    hdma        = (HDMATransfer*) malloc(sizeof(HDMATransfer));
-    bios_locked = false;
-    for (uint8_t i = 0; i < VRAM_BANK_QUANTITY; i++)
+    if ((address < VRAM_ADDRESS_START) || (address > VRAM_ADDRESS_END))
     {
-        vram[i] = (uint8_t*) malloc(VRAM_BANK_SIZE * sizeof(uint8_t));
+        LOG_MESSAGE(ERROR, "Invalid VRAM read attempt: %04X", address);
+        return 0xFF;
     }
-    for (uint8_t i = 0; i < WRAM_BANK_QUANTITY; i++)
-    {
-        wram[i] = (uint8_t*) malloc(WRAM_BANK_SIZE * sizeof(uint8_t));
-    }
-}
-
-void tidy_memory()
-{
-    free(memory);
-    memory = NULL;
-    for (uint8_t i = 0; i < VRAM_BANK_QUANTITY; i++)
-    {
-        free(vram[i]);
-        vram[i] = NULL;
-    }
-    free(vram);
-    vram = NULL;
-    for (int i = 0; i < WRAM_BANK_QUANTITY; i++)
-    {
-        free(wram[i]);
-        wram[i] = NULL;
-    }
-    free(wram);
-    wram = NULL;
-    free(hdma);
-    hdma = NULL;
-    free(dma);
-    dma = NULL;
-    free(cram);
-    cram = NULL;
-}
-
-uint8_t *read_vram(uint8_t bank, uint16_t address)
-{
     address -= (uint16_t) VRAM_ADDRESS_START;
-    return &(vram[bank][address]);
+    return vram[bank][address];
 }
 
-uint8_t *read_cram(bool is_obj, uint8_t palette_index, uint8_t color_id)
+uint8_t read_cram(bool is_obj, uint8_t palette_index, uint8_t color_id, uint8_t index)
 {
     uint8_t base   = is_obj ? 0x40 : 0x00;
     uint8_t offset = (palette_index << 3) | (color_id << 1);
-    return &(cram[base + offset]);
+    return cram[base + offset + index];
 }
 
-void check_dma()
+uint8_t read_memory(uint16_t address)
 {
-    if(!dma->active) return;
-    if(dma->cycles_left > 0)
+    if (address <= BANK_N_ADDRESS_END)
     {
-        uint8_t src_val = *read_memory(dma->src_address++);
-        write_memory(dma->dst_address++, src_val);
-        dma->cycles_left -= 1;  
+        return read_rom_memory(address); 
     }
-    if(dma->cycles_left <= 0)
+    else if (address <= VRAM_ADDRESS_END)
     {
-        dma->active = false;
+        uint8_t value = 
+        memory[VBK] ? read_vram(1, address) : read_vram(0, address);
+        return value;
     }
+    else if (address <= EXT_RAM_ADDRESS_END)
+    {
+        return read_rom_memory(address);
+    }
+    else if (address <= WRAM_ZERO_ADDRESS_END)
+    {
+        address -= (uint16_t) WRAM_ZERO_ADDRESS_START;
+        return wram[0][address];
+    }
+    else if (address <= WRAM_N_ADDRESS_END)
+    {  
+        uint8_t svbk = memory[SVBK] & LOWER_3_MASK;
+        if (!svbk) svbk = 1;
+        address -= (uint16_t) WRAM_N_ADDRESS_START;
+        return wram[svbk][address];
+    }
+    else if (address <= ECHO_RAM_ADDRESS_END)
+    {
+        return read_memory(address - ECHO_RAM_OFFSET);
+    }
+    else if (address <= OAM_ADDRESS_END)
+    {
+        return memory[address];
+    }
+    else if (address <= NOT_USABLE_END)
+    {
+        return memory[address];
+    }
+    else if (address <= IO_REGISTERS_END)
+    {
+        return io_memory_read(address);
+    }
+    else if (address <= INTERRUPT_ENABLE_ADDRESS)
+    { // Implicit High RAM
+        return memory[address];
+    }
+    LOG_MESSAGE(ERROR, "Attempted Read from unmapped address: %04X", address);
+    return 0xFF; // Return garbage if we ever get here.
 }
 
-bool dma_active()
-{
-    return (dma->active);
+void write_memory(uint16_t address, uint8_t value)
+{ 
+    if (address <= BANK_N_ADDRESS_END)
+    {
+        write_rom_memory(address, value);
+        return;
+    }
+    else if (address <= VRAM_ADDRESS_END)
+    {
+        uint8_t bank = (is_gbc() && memory[VBK]) ? 1 : 0;
+        address -= (uint16_t) VRAM_ADDRESS_START;
+        vram[bank][address] = value;
+        return;
+    }
+    else if (address <= EXT_RAM_ADDRESS_END)
+    {
+        write_rom_memory(address, value);
+        return;
+    }
+    else if (address <= WRAM_ZERO_ADDRESS_END)
+    {
+        address -= (uint16_t) WRAM_ZERO_ADDRESS_START;
+        wram[0][address] = value;
+        return;
+    }
+    else if (address <= WRAM_N_ADDRESS_END)
+    { // Banks 1-7
+        uint8_t svbk = (memory[SVBK] & LOWER_3_MASK);
+        if (!svbk) svbk = 1;
+        address -= (uint16_t) WRAM_N_ADDRESS_START;
+        wram[svbk][address] = value;
+        return;
+    }
+    else if (address <= ECHO_RAM_ADDRESS_END)
+    {
+        write_memory(address - ECHO_RAM_OFFSET, value);
+        return;
+    }
+    else if ((address >= IO_REGISTERS_START) && (address <= IO_REGISTERS_END))
+    { // Bypass 'not usable' memory range
+        io_memory_write(address, value);
+        return;
+    }
+    else if (address <= HIGH_RAM_ADDRESS_END)
+    { // implicit High RAM
+        memory[address] = value;
+        return;
+    }
+    else if (address == INTERRUPT_ENABLE_ADDRESS)
+    {
+        memory[address] = value;
+        return;
+    }
+    LOG_MESSAGE(ERROR, "Attempted write to invalid address: %04X", address);
 }
+
+/* DEBUG */
 
 uint8_t *get_memory()
 {
     return memory;
+}
+
+uint8_t *get_memory_pointer(uint16_t address)
+{
+    return &(memory[address]);
 }
 
 void print_vram(uint16_t start, uint16_t end, bool bank)
@@ -279,106 +481,5 @@ void print_vram(uint16_t start, uint16_t end, bool bank)
         {
             LOG_MESSAGE(INFO, "%04X: %02X", i, vram[0][i - VRAM_ADDRESS_START]);
         }
-    }
-}
-
-uint8_t *read_memory(uint16_t address)
-{
-    if (address <= BANK_N_ADDRESS_END)
-    {
-        memory[address] = read_rom_memory(address);
-        return &(memory[address]); 
-    }
-    else if (address <= VRAM_ADDRESS_END)
-    {
-        uint8_t *value = 
-        (bool) memory[VBK] ? 
-        &(vram[1][address - ((uint16_t) VRAM_ADDRESS_START)]):
-        &(vram[0][address - ((uint16_t) VRAM_ADDRESS_START)]);
-        return value;
-    }
-    else if (address <= EXT_RAM_ADDRESS_END)
-    {
-        uint8_t value = read_rom_memory(address);
-        memory[address] = value;
-        return &(memory[address]); 
-    }
-    else if (address <= WRAM_ZERO_ADDRESS_END)
-    {
-        address -= (uint16_t) WRAM_ZERO_ADDRESS_START;
-        return &(wram[0][address]);
-    }
-    else if (address <= WRAM_N_ADDRESS_END)
-    {  
-        uint8_t svbk = memory[SVBK] & LOWER_3_MASK;
-        if (!svbk) svbk = 1;
-        address -= (uint16_t) WRAM_N_ADDRESS_START;
-        return &(wram[svbk][address]);
-    }
-    else if (address <= ECHO_RAM_ADDRESS_END)
-    {
-        address -= (uint16_t) ECHO_RAM_OFFSET;
-        memory[address] = memory[address];
-        return &(memory[address]);
-    }
-    else if (address <= OAM_ADDRESS_END)
-    {
-        return &(memory[address]);
-    }
-    else if (address <= IO_REGISTERS_END)
-    {
-        return io_memory_read(address);
-    }
-    else if (address <= INTERRUPT_ENABLE_ADDRESS)
-    {
-        return &(memory[address]);
-    }
-    return &(memory[INTERRUPT_ENABLE_ADDRESS]);
-}
-
-void write_memory(uint16_t address, uint8_t value)
-{ 
-    if (address <= BANK_N_ADDRESS_END)
-    {
-        write_rom_memory(address, value);
-    }
-    else if (address <= VRAM_ADDRESS_END)
-    {
-        address -= (uint16_t) VRAM_ADDRESS_START;
-        vram[((bool) memory[VBK])][address] = value;
-    }
-    else if (address <= EXT_RAM_ADDRESS_END)
-    {
-        write_rom_memory(address, value);
-    }
-    else if (address <= WRAM_ZERO_ADDRESS_END)
-    {
-        address -= (uint16_t) WRAM_ZERO_ADDRESS_START;
-        wram[0][address] = value;
-    }
-    else if (address <= WRAM_N_ADDRESS_END)
-    {
-        uint8_t svbk = (memory[SVBK] & LOWER_3_MASK);
-        if (!svbk) svbk = 1;
-        address -= (uint16_t) WRAM_N_ADDRESS_START;
-        wram[svbk][address] = value;
-    }
-    else if (address <= ECHO_RAM_ADDRESS_END)
-    {
-        memory[address] = value; 
-        address -= (uint16_t) ECHO_RAM_OFFSET;
-        memory[address - ECHO_RAM_OFFSET] = value;
-    }
-    else if (address <= OAM_ADDRESS_END)
-    {
-        memory[address] = value;
-    }
-    else if (address > NOT_USABLE_END && address <= IO_REGISTERS_END)
-    {
-        io_memory_write(address, value);
-    }
-    else if (address <= INTERRUPT_ENABLE_ADDRESS)
-    {
-        memory[address] = value;
     }
 }

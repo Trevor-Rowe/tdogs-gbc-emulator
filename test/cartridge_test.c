@@ -1,6 +1,5 @@
 #include <CUnit/CUnit.h> 
 #include <CUnit/Basic.h>
-#include "cartridge.c"
 
 void test_get_cartridge()
 {
@@ -10,8 +9,6 @@ void test_get_cartridge()
 
 int main()
 {
-    char *file_path = "../roms/Tetris.gb";
-    init_cartridge(file_path, false);
     // Initialize the CUnit test registry
     if (CUE_SUCCESS != CU_initialize_registry()) {
         return CU_get_error();

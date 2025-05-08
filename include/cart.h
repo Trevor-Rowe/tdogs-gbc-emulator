@@ -1,8 +1,5 @@
-#ifndef CARTRIDGE_H
-#define CARTRIDGE_H
-
-#include <stdint.h>
-#include <stdbool.h>
+#ifndef CART_H
+#define CART_H
 
 /*
     Reads in ROM and initializes cartridge context. 
