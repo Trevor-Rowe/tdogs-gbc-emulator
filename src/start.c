@@ -5,9 +5,9 @@
 
 static void load_rom(char *path)
 {
-    init_emulator(path, 0x0000);
+    init_emulator(path, true);
     start_emulator();
-    tidy_emulator();
+    tidy_emulator(true);
     SDL_Delay(100);
 }
 
@@ -63,12 +63,12 @@ static void run_cpu_test(uint8_t test)
 
 int main() 
 {   
-    //for (int i = 1; i <= 11; i++) { run_cpu_test(i); }
+    //for (int i = 2; i <= 2; i++) { run_cpu_test(i); }
     //load_rom("../roms/gb-test-roms-master/instr_timing/instr_timing.gb");
     //load_rom("../roms/gb-test-roms-master/mem_timing/mem_timing.gb");
     //load_rom("../roms/gb-test-roms-master/interrupt_time/interrupt_time.gb");
     //load_rom("../roms/gb-test-roms-master/halt_bug.gb");
     
-    //load_rom("../roms/assembly/timer_test.gb");
+    //load_rom("../roms/assembly/sprite_rendering.gb");
     load_rom("../roms/Tetris.gb");
 }

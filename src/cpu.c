@@ -109,7 +109,7 @@ static uint8_t fetch()
     {
         cpu->halt_bug_active = false;
         rom_byte = read_memory(R->PC);
-        cpu_log(INFO, "Halt Bug Fetch %02X", rom_byte);
+        cpu_log(DEBUG, "Halt Bug Fetch %02X", rom_byte);
     }
     else
     {
@@ -6035,8 +6035,11 @@ static void execute_ins(InstructionEntity *ins)
     if (complete)
     {
         check_ime(iee);
-        bool serviced = service_interrupts(ins); 
-        if (serviced) return;
+        if (!cb_prefixed)
+        {
+            bool serviced = service_interrupts(ins); 
+            if (serviced) return;
+        }
         next_ins(ins);
     }
 }
@@ -6059,7 +6062,7 @@ uint8_t get_machine_cycle_scaler()
    return mcs;
 }
 
-void reset_pc()
+void reset_cpu()
 {
     R->PC = 0x0000;
 }

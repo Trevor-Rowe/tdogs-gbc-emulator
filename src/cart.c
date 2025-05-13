@@ -119,6 +119,7 @@ static uint8_t      *rom;
 static uint8_t *dmg_bios;
 static uint8_t *cgb_bios;
 static uint8_t     *bios;
+static char   *main_file;
 
 /* STATIC (PRIVATE) HELPERS FUNCTIONS */
 
@@ -357,7 +358,6 @@ static uint8_t mbc1_ram_read(Cartridge *cart, uint16_t address)
         return rom[ext_address];        
     }
 }
-
 
 static uint8_t mbc2_read(Cartridge *cart, uint16_t address)
 {
@@ -633,14 +633,15 @@ void write_rom_memory(uint16_t address, uint8_t value) // Public API
     mbc_write_table[cart->cart_code](cart, address, value);
 }
 
-int init_cartridge(char *file_path, uint16_t entry)
+void init_cartridge(char *file_path)
 {
-    header   = (Header*) malloc(sizeof(Header));
-    cart     = (Cartridge*) malloc(sizeof(Cartridge));
-    dmg_bios = get_rom_content(DMG_BIOS,  cart);
-    cgb_bios = get_rom_content(CGB_BIOS,  cart);
-    rom      = get_rom_content(file_path, cart);
-    bios = get_memory_pointer(BIOS);
+    header    = (Header*) malloc(sizeof(Header));
+    cart      = (Cartridge*) malloc(sizeof(Cartridge));
+    dmg_bios  = get_rom_content(DMG_BIOS,  cart);
+    cgb_bios  = get_rom_content(CGB_BIOS,  cart);
+    rom       = get_rom_content(file_path, cart);
+    bios      = get_memory_pointer(BIOS);
+    main_file = file_path;
     load_header(header, rom);
     encode_rom_settings(cart);
     encode_ram_settings(cart, header);

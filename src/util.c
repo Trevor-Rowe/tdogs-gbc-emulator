@@ -58,6 +58,7 @@ void enqueue(Queue *queue, GbcPixel *value)
     temp->  tile_index = value->tile_index;
     temp-> dmg_palette = value->dmg_palette;
     temp->        bank = value->bank;
+    temp->      is_obj = value->is_obj;
     temp->obj_priority = value->obj_priority;
     temp-> bg_priority = value->bg_priority;
     temp->      x_flip = value->x_flip;

@@ -13,6 +13,7 @@
 #include "timer.h"
 
 #define LOG_MESSAGE(level, format, ...) log_message(level, __FILE__, __func__, format, ##__VA_ARGS__)
+#define DEFAULT_TURBO 4
 #define FRAME_PERIOD 16.74
 #define SCALE 4
 
@@ -23,6 +24,7 @@ static bool              running;
 static bool      frame_available;
 static SDL_mutex          *mutex;
 static SDL_cond     *frame_ready;
+static char      *cartridge_file;
 
 JoypadState *joypad;
 
@@ -103,6 +105,9 @@ static void init_joypad()
     joypad->  DOWN = false;
     joypad-> RIGHT = false;
     joypad->  LEFT = false;
+
+    joypad->turbo_enabled = false;
+    joypad-> turbo_scaler = DEFAULT_TURBO;
 }
 
 static void tidy_joypad()
@@ -110,33 +115,43 @@ static void tidy_joypad()
     free(joypad); joypad = NULL;
 }
 
-void init_emulator(char *file_path, uint16_t entry)
+void init_emulator(char *file_path, bool display)
 {
     init_memory();
     LOG_MESSAGE(INFO, "Memory initialized.");
     init_timer();
     LOG_MESSAGE(INFO, "Timer initialized.");
-    init_cartridge(file_path, entry);
+    init_cartridge(file_path);
     LOG_MESSAGE(INFO, "Cartridge initialized.");
     init_cpu();
     LOG_MESSAGE(INFO, "CPU initialized.");
     init_graphics();
     LOG_MESSAGE(INFO, "Graphics initialized.");
-    init_display();
-    LOG_MESSAGE(INFO, "Display initialized.");
-    init_joypad();
-    LOG_MESSAGE(INFO, "Joypad, locked and loaded!");
+
+    if (display)
+    {
+        init_display();
+        LOG_MESSAGE(INFO, "Display initialized.");
+
+        init_joypad();
+        LOG_MESSAGE(INFO, "Joypad, locked and loaded!");
+    }
+
+    cartridge_file = file_path;
 }
 
-void tidy_emulator()
+void tidy_emulator(bool display)
 {
     tidy_memory();
     tidy_timer();
     tidy_cartridge();
     tidy_cpu();
     tidy_graphics();
-    tidy_display();
-    tidy_joypad();
+    if (display) 
+    {
+        tidy_display();
+        tidy_joypad();
+    }
 }
 
 int emu_thread(void *data)
@@ -176,6 +191,31 @@ char *get_joypad_state(char *buffer, uint8_t size)
     return buffer;
 }
 
+static void reset_emulator()
+{
+    if (joypad->turbo_enabled) return;
+    tidy_emulator(false);
+    init_emulator(cartridge_file, false);
+}
+
+static void increment_turbo(JoypadState *joypad)
+{
+    joypad->turbo_scaler += 1;
+    if (joypad->turbo_scaler > 10) 
+    {
+        joypad->turbo_scaler = 10;
+    }
+}
+
+static void decrement_turbo(JoypadState *joypad)
+{
+    joypad->turbo_scaler -= 1;
+    if (joypad->turbo_scaler < 1) 
+    {
+        joypad->turbo_scaler = 1;
+    } 
+}
+
 static void handle_button_press(SDL_Event *event)
 {
     if (!joypad || event->key.repeat) return;
@@ -184,14 +224,15 @@ static void handle_button_press(SDL_Event *event)
 
     switch (key)
     {
-        case SDLK_x:         joypad->     A = true; break;
-        case SDLK_z:         joypad->     B = true; break;
-        case SDLK_RETURN:    joypad-> START = true; break;
-        case SDLK_BACKSPACE: joypad->SELECT = true; break;
-        case SDLK_UP:        joypad->    UP = true; break;
-        case SDLK_DOWN:      joypad->  DOWN = true; break;
-        case SDLK_RIGHT:     joypad-> RIGHT = true; break;
-        case SDLK_LEFT:      joypad->  LEFT = true; break;
+        case SDLK_x:         joypad->            A = true; break;
+        case SDLK_z:         joypad->            B = true; break;
+        case SDLK_RETURN:    joypad->        START = true; break;
+        case SDLK_BACKSPACE: joypad->       SELECT = true; break;
+        case SDLK_UP:        joypad->           UP = true; break;
+        case SDLK_DOWN:      joypad->         DOWN = true; break;
+        case SDLK_RIGHT:     joypad->        RIGHT = true; break;
+        case SDLK_LEFT:      joypad->         LEFT = true; break;
+        case SDLK_SPACE:     joypad->turbo_enabled = true; break;
     }
 }
 
@@ -203,14 +244,18 @@ static void handle_button_release(SDL_Event *event)
 
     switch (key)
     {
-        case SDLK_x:         joypad->     A = false; break;
-        case SDLK_z:         joypad->     B = false; break;
-        case SDLK_RETURN:    joypad-> START = false; break;
-        case SDLK_BACKSPACE: joypad->SELECT = false; break;
-        case SDLK_UP:        joypad->    UP = false; break;
-        case SDLK_DOWN:      joypad->  DOWN = false; break;
-        case SDLK_RIGHT:     joypad-> RIGHT = false; break;
-        case SDLK_LEFT:      joypad->  LEFT = false; break;
+        case SDLK_p:         increment_turbo(joypad);       break;
+        case SDLK_o:         decrement_turbo(joypad);       break;
+        case SDLK_r:         reset_emulator();              break;
+        case SDLK_x:         joypad->            A = false; break;
+        case SDLK_z:         joypad->            B = false; break;
+        case SDLK_RETURN:    joypad->        START = false; break;
+        case SDLK_BACKSPACE: joypad->       SELECT = false; break;
+        case SDLK_UP:        joypad->           UP = false; break;
+        case SDLK_DOWN:      joypad->         DOWN = false; break;
+        case SDLK_RIGHT:     joypad->        RIGHT = false; break;
+        case SDLK_LEFT:      joypad->         LEFT = false; break;
+        case SDLK_SPACE:     joypad->turbo_enabled = false; break;
     }
 }
 
@@ -270,19 +315,23 @@ void start_emulator()
         frame_available = false;
         SDL_CondSignal(frame_ready);
         SDL_UnlockMutex(mutex);
+        
         // Frame ready, good to go.
         // Consume frame and update texture to render.
         SDL_UpdateTexture(framebuffer, NULL, render_frame(), GBC_WIDTH * sizeof(uint32_t));
         SDL_RenderClear(renderer);
         SDL_RenderCopy(renderer, framebuffer, NULL, NULL);
         SDL_RenderPresent(renderer);
+
         // Calculate and provide frame delay.
         Uint64 perf_freq = SDL_GetPerformanceFrequency();
         Uint64 elapsed = SDL_GetPerformanceCounter() - start_time;
         double elapsed_ms = ((double) elapsed / perf_freq) * 1e3;
         if (elapsed_ms < FRAME_PERIOD)
         {
-            SDL_Delay((Uint32)((FRAME_PERIOD - elapsed_ms)));        
+            uint32_t delay = (Uint32)(FRAME_PERIOD - elapsed_ms);
+            delay = joypad->turbo_enabled ? (delay / joypad->turbo_scaler) : delay;
+            SDL_Delay(delay);        
         }
     }
     SDL_WaitThread(emulation_thread, NULL);

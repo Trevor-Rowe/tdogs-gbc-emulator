@@ -10,7 +10,8 @@ typedef struct
     uint8_t            y;
     uint8_t   tile_index;
     uint8_t         bank;
-    uint8_t  dmg_palette; 
+    uint8_t  dmg_palette;
+    bool          is_obj;
     bool    obj_priority;
     bool     bg_priority;   
     bool          x_flip;

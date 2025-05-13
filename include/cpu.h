@@ -54,7 +54,7 @@ void init_cpu();
 
 void tidy_cpu();
 
-void reset_pc();
+void reset_cpu();
 
 void start_cpu();
 

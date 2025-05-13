@@ -3,13 +3,6 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-/*
-    Initializes emulator and all its dependencies.
-    @param file_path: location of file to read in.
-    @param testing  : flag for extra debug info.
-    @note: CALL THIS FIRST.
-*/
-void init_emulator(char *file_path, uint16_t entry);
 
 typedef enum
 {
@@ -29,11 +22,16 @@ typedef struct
     bool     A, B, SELECT, START;
     bool     RIGHT, LEFT, UP, DOWN;
 
+    uint8_t turbo_scaler;
+    bool   turbo_enabled;
+
 } JoypadState;
 
 JoypadState *get_joypad();
 
-void tidy_emulator();
+void init_emulator(char *file_path, bool display);
+
+void tidy_emulator(bool reset_display);
 
 void start_emulator();
 

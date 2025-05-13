@@ -8,7 +8,7 @@
     @return int (bool) -> Was initialization successful?
     @note              -> Call this function first. :)  
 */
-int init_cartridge(char *file_path, uint16_t entry);
+void init_cartridge(char *file_path);
 
 /*
     Prints header, rom, and ram information derived from the ROM file.
@@ -42,10 +42,6 @@ uint8_t read_rom_memory(uint16_t address);
 */
 void write_rom_memory(uint16_t address, uint8_t value);
 
-/*
-    @return        -> Address to begin ROM execution.
-*/
-uint16_t get_rom_start(); 
 
 bool is_gbc();
 
